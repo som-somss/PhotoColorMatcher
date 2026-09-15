@@ -119,15 +119,37 @@ def apply_manual_adjustments(bgr, brightness=0, contrast=0, saturation=0,
     return cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
 
 
-def remove_masked_object(bgr, mask, radius=5):
-    """Offline object removal using OpenCV inpainting."""
+def remove_masked_object(bgr, mask, radius=5, strength=70):
+    """Offline object removal with adjustable strength and local sharpening."""
     if mask is None or not np.any(mask):
         return bgr.copy()
+
     mask8 = np.where(mask > 0, 255, 0).astype(np.uint8)
-    # Slight dilation helps remove object edges as well.
+    strength = int(np.clip(strength, 0, 100))
+    alpha = strength / 100.0
+
+    # 강도가 높을수록 물체 테두리까지 조금 더 넓게 제거
+    iterations = 1 if strength < 55 else 2 if strength < 85 else 3
     kernel = np.ones((3, 3), np.uint8)
-    mask8 = cv2.dilate(mask8, kernel, iterations=1)
-    return cv2.inpaint(bgr, mask8, float(radius), cv2.INPAINT_TELEA)
+    work_mask = cv2.dilate(mask8, kernel, iterations=iterations)
+
+    r = max(1.0, float(radius))
+
+    # 서로 다른 두 복원 방식을 혼합하여 단순 번짐을 줄임
+    telea = cv2.inpaint(bgr, work_mask, r, cv2.INPAINT_TELEA)
+    ns = cv2.inpaint(bgr, work_mask, max(1.0, r * 0.75), cv2.INPAINT_NS)
+    repaired = cv2.addWeighted(telea, 1.0 - 0.55 * alpha, ns, 0.55 * alpha, 0)
+
+    # 복원 영역에만 국부 선명화 적용
+    amount = 0.20 + 1.20 * alpha
+    blurred = cv2.GaussianBlur(repaired, (0, 0), 1.0)
+    sharpened = cv2.addWeighted(repaired, 1.0 + amount, blurred, -amount, 0)
+
+    # 경계만 자연스럽게 연결하고 내부는 선명하게 유지
+    feather = cv2.GaussianBlur(work_mask, (0, 0), 0.65).astype(np.float32) / 255.0
+    feather = feather[..., None]
+    out = bgr.astype(np.float32) * (1.0 - feather) + sharpened.astype(np.float32) * feather
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 class PhotoColorMatcherApp(tk.Tk):
@@ -169,6 +191,8 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_history = []
         self.brush_size = tk.DoubleVar(value=35)
         self.inpaint_radius = tk.DoubleVar(value=5)
+        self.remove_strength = tk.DoubleVar(value=70)
+        self.brush_preview_id = None
 
         self._build_ui()
         self.bind_all("<Control-s>", self._ctrl_save)
@@ -285,13 +309,20 @@ class PhotoColorMatcherApp(tk.Tk):
         ttk.Label(opts, text="브러시 크기").pack(side="left")
         ttk.Scale(opts, from_=5, to=120, variable=self.brush_size, length=220).pack(side="left", padx=(6, 18))
         ttk.Label(opts, text="복원 범위").pack(side="left")
-        ttk.Scale(opts, from_=1, to=15, variable=self.inpaint_radius, length=180).pack(side="left", padx=6)
-        ttk.Label(opts, text="삭제할 물체를 마우스로 칠한 뒤 '선택 영역 삭제'를 누르세요.").pack(side="left", padx=14)
+        ttk.Scale(opts, from_=1, to=15, variable=self.inpaint_radius, length=150).pack(side="left", padx=6)
+        ttk.Label(opts, text="삭제 강도").pack(side="left", padx=(12, 0))
+        ttk.Scale(opts, from_=0, to=100, variable=self.remove_strength, length=150).pack(side="left", padx=6)
+        self.remove_strength_label = ttk.Label(opts, text="70", width=4)
+        self.remove_strength_label.pack(side="left")
+        self.remove_strength.trace_add("write", lambda *_: self.remove_strength_label.config(text=str(int(self.remove_strength.get()))))
+        ttk.Label(opts, text="삭제할 물체를 칠한 뒤 '선택 영역 삭제'를 누르세요.").pack(side="left", padx=12)
 
         self.object_canvas = tk.Canvas(wrap, bg="#333333", highlightthickness=0, cursor="crosshair")
         self.object_canvas.pack(fill="both", expand=True)
         self.object_canvas.bind("<Button-1>", self.paint_object_mask)
         self.object_canvas.bind("<B1-Motion>", self.paint_object_mask)
+        self.object_canvas.bind("<Motion>", self.show_brush_preview)
+        self.object_canvas.bind("<Leave>", self.hide_brush_preview)
         self.object_canvas.bind("<Configure>", lambda e: self.refresh_object_canvas())
 
     def open_object_image(self):
@@ -336,6 +367,32 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_canvas.delete("all")
         self.object_canvas.create_image(ox, oy, anchor="nw", image=self.object_display_photo)
 
+    def show_brush_preview(self, event):
+        """현재 브러시 크기를 마우스 위치에 빨간 원으로 표시."""
+        if self.object_result is None:
+            return
+        if self.brush_preview_id is not None:
+            try:
+                self.object_canvas.delete(self.brush_preview_id)
+            except Exception:
+                pass
+        # brush_size는 화면상 직경 기준
+        radius = max(2, int(self.brush_size.get() / 2))
+        self.brush_preview_id = self.object_canvas.create_oval(
+            event.x - radius, event.y - radius,
+            event.x + radius, event.y + radius,
+            outline="#ff3b30", width=2, tags=("brush_preview",)
+        )
+        self.object_canvas.tag_raise(self.brush_preview_id)
+
+    def hide_brush_preview(self, event=None):
+        if self.brush_preview_id is not None:
+            try:
+                self.object_canvas.delete(self.brush_preview_id)
+            except Exception:
+                pass
+            self.brush_preview_id = None
+
     def paint_object_mask(self, event):
         if self.object_result is None or self.object_mask is None:
             return
@@ -348,6 +405,7 @@ class PhotoColorMatcherApp(tk.Tk):
             radius = max(1, int(self.brush_size.get() / max(scale, 1e-6) / 2))
             cv2.circle(self.object_mask, (x, y), radius, 255, -1)
             self.refresh_object_canvas()
+            self.show_brush_preview(event)
 
     def clear_object_mask(self):
         if self.object_mask is not None:
@@ -363,7 +421,10 @@ class PhotoColorMatcherApp(tk.Tk):
             return
         self.object_history.append(self.object_result.copy())
         self.object_result = remove_masked_object(
-            self.object_result, self.object_mask, int(round(self.inpaint_radius.get()))
+            self.object_result,
+            self.object_mask,
+            int(round(self.inpaint_radius.get())),
+            int(round(self.remove_strength.get()))
         )
         self.object_mask[:] = 0
         self.refresh_object_canvas()
