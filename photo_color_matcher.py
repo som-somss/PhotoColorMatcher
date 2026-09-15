@@ -171,6 +171,8 @@ class PhotoColorMatcherApp(tk.Tk):
         self.inpaint_radius = tk.DoubleVar(value=5)
 
         self._build_ui()
+        self.bind_all("<Control-s>", self._ctrl_save)
+        self.bind_all("<Control-S>", self._ctrl_save)
 
     def _build_ui(self):
         notebook = ttk.Notebook(self)
@@ -248,7 +250,10 @@ class PhotoColorMatcherApp(tk.Tk):
         self.progress.pack(fill="x")
         self.status = ttk.Label(bottom, text="준비됨")
         self.status.pack(anchor="w", pady=(4, 4))
-        ttk.Button(bottom, text="자동 색감 보정 시작", command=self.start_processing).pack(fill="x", ipady=8)
+        savebar = ttk.Frame(bottom)
+        savebar.pack(fill="x", pady=(4, 4))
+        ttk.Button(savebar, text="현재 보정 결과 저장 (Ctrl+S)", command=self.save_current_color_result).pack(side="left", fill="x", expand=True)
+        ttk.Button(savebar, text="전체 일괄 저장", command=self.start_processing).pack(side="left", fill="x", expand=True, padx=(8, 0))
 
         self._build_remove_tab(remove_tab)
 
@@ -506,6 +511,44 @@ class PhotoColorMatcherApp(tk.Tk):
         else:
             self.preview_photo_after = photo
 
+    def _ctrl_save(self, event=None):
+        self.save_current_color_result()
+        return "break"
+
+    def save_current_color_result(self):
+        src = self._selected_source()
+        ref = self.ref_path.get()
+        if not src or not Path(src).exists():
+            messagebox.showwarning(APP_TITLE, "저장할 보정 사진을 선택해주세요.")
+            return
+        if not ref or not Path(ref).exists():
+            messagebox.showwarning(APP_TITLE, "기준 사진을 선택해주세요.")
+            return
+        src_path = Path(src)
+        ext = src_path.suffix.lower()
+        if ext not in SUPPORTED:
+            ext = ".jpg"
+        p = filedialog.asksaveasfilename(
+            title="현재 보정 결과 저장",
+            initialdir=self.output_dir.get() if Path(self.output_dir.get()).exists() else str(src_path.parent),
+            initialfile=f"{src_path.stem}_matched{ext}",
+            defaultextension=ext,
+            filetypes=[("원본 형식", f"*{ext}"), ("JPEG", "*.jpg *.jpeg"), ("PNG", "*.png"), ("모든 파일", "*.*")],
+        )
+        if not p:
+            return
+        try:
+            bgr, exif, icc, dpi = read_image(src_path)
+            ref_bgr, *_ = read_image(ref)
+            ref_mean, ref_std = lab_stats(ref_bgr)
+            result = self._process_one(bgr, ref_mean, ref_std)
+            save_image(p, result, exif=exif, icc=icc, dpi=dpi, jpeg_quality=98)
+            self.output_dir.set(str(Path(p).parent))
+            self.status.config(text=f"저장 완료: {Path(p).name}")
+            messagebox.showinfo(APP_TITLE, f"현재 보정 결과를 저장했습니다.\n\n{p}")
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"저장 중 오류가 발생했습니다.\n{e}")
+
     def start_processing(self):
         if not self.ref_path.get() or not Path(self.ref_path.get()).exists():
             messagebox.showwarning(APP_TITLE, "기준 사진을 선택해주세요.")
@@ -550,7 +593,7 @@ class PhotoColorMatcherApp(tk.Tk):
                     dest_dir = output_root / rel_parent
                     dest_dir.mkdir(parents=True, exist_ok=True)
                     dest = dest_dir / f"{src_path.stem}_matched{src_path.suffix}"
-                    save_image(dest, result, exif=exif, icc=icc, dpi=dpi)
+                    save_image(dest, result, exif=exif, icc=icc, dpi=dpi, jpeg_quality=98)
                     ok += 1
                 except Exception as e:
                     errors.append(f"{src}: {e}")
