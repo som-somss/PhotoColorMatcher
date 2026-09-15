@@ -258,7 +258,8 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_brightness = tk.DoubleVar(value=0)
 
         self._build_ui()
-        # V8.2: Ctrl +/- changes brush size anywhere in the app.        self.bind_all("<Escape>", lambda e: self.cancel_v83_selection())
+        # V8.2: Ctrl +/- changes brush size anywhere in the app.
+        self.bind_all("<Escape>", lambda e: self.cancel_v83_selection())
 
         self.bind_all("<Control-plus>", lambda e: self.adjust_brush_size_shortcut(+1))
         self.bind_all("<Control-equal>", lambda e: self.adjust_brush_size_shortcut(+1))
@@ -413,7 +414,7 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_canvas.bind("<Button-1>", self.object_canvas_click)
         self.object_canvas.bind("<B1-Motion>", self.object_canvas_drag)
         self.object_canvas.bind("<ButtonRelease-1>", self.object_canvas_release)
-        self.object_canvas.bind("<Double-Button-1>", lambda e: self.finish_manual_selection() if self.object_select_mode else None)
+        self.object_canvas.bind("<Double-Button-1>", lambda e: self.finish_manual_selection() if self.active_remove_tool == "free" else None)
         self.bind_all("<Control-d>", self.activate_clone_source_mode)
         self.bind_all("<Control-D>", self.activate_clone_source_mode)
         self.object_canvas.bind("<Motion>", self.show_brush_preview)
@@ -494,6 +495,19 @@ class PhotoColorMatcherApp(tk.Tk):
                 except Exception: pass
         return "break"
 
+    def _set_remove_tool_bindings(self, tool):
+        """Keep exactly one active mouse tool."""
+        self.active_remove_tool = tool
+        self.object_select_mode = (tool == "free")
+        if tool == "free":
+            self.object_select_points = []
+        else:
+            self.object_select_points = []
+        self.hide_brush_preview()
+        if hasattr(self, "object_canvas"):
+            self.object_canvas.configure(cursor="pencil" if tool == "brush" else "crosshair")
+        return "break"
+
     def set_selection_tool(self, tool):
         self.clone_source_mode = False
         self.selection_tool.set(tool)
@@ -508,20 +522,9 @@ class PhotoColorMatcherApp(tk.Tk):
         except Exception: pass
 
     def _canvas_to_image_xy(self, x, y):
-        """Convert canvas coordinates to original-image coordinates, respecting V8.1 zoom."""
-        # Prefer existing conversion helper if this version has one.
-        for helper_name in ("canvas_to_image", "canvas_to_image_coords", "object_canvas_to_image"):
-            helper = getattr(self, helper_name, None)
-            if callable(helper):
-                try:
-                    return helper(x, y)
-                except Exception:
-                    pass
-
-        zoom = float(getattr(self, "object_zoom", getattr(self, "zoom_scale", 1.0)) or 1.0)
-        ox = float(getattr(self, "object_image_offset_x", getattr(self, "image_offset_x", 0)) or 0)
-        oy = float(getattr(self, "object_image_offset_y", getattr(self, "image_offset_y", 0)) or 0)
-        return int(round((x - ox) / zoom)), int(round((y - oy) / zoom))
+        scale = max(float(self.object_display_scale), 1e-6)
+        ox, oy = self.object_display_offset
+        return int((x - ox) / scale), int((y - oy) / scale)
 
     def shape_select_start(self, event):
         self.shape_drag_start = (event.x, event.y)
@@ -558,11 +561,7 @@ class PhotoColorMatcherApp(tk.Tk):
             return
 
         # Determine original image size.
-        img = getattr(self, "object_working", None)
-        if img is None:
-            img = getattr(self, "object_image", None)
-        if img is None:
-            img = getattr(self, "current_image", None)
+        img = self.object_result
         if img is None:
             return
 
@@ -728,13 +727,11 @@ class PhotoColorMatcherApp(tk.Tk):
         mask = np.zeros(self.object_result.shape[:2], dtype=np.uint8)
         cv2.fillPoly(mask, [pts], 255)
         self.object_mask = mask
+        self.selection_mask = mask.copy()
         self.object_edit_mask = mask.copy()
         self.object_select_mode = False
-        self.edit_tool = "brush"
         self.object_select_points = []
-        self.object_select_status.config(text="직접 선택 완료 · 색상 변경/삭제 가능 · 브러시로 선택 영역 추가 수정 가능")
-        if hasattr(self, "selection_mask") and isinstance(self.selection_mask, np.ndarray):
-            self.object_mask = self.selection_mask.copy()
+        self.object_select_status.config(text="직접 선택 완료 · 색상 변경/삭제 가능")
         self.refresh_object_canvas()
 
     def _canvas_to_image(self, cx, cy):
@@ -771,9 +768,7 @@ class PhotoColorMatcherApp(tk.Tk):
         rgb, hex_color = picked
         self.selected_object_color_hex = hex_color
 
-        img = getattr(self, "object_working", None)
-        if img is None:
-            img = getattr(self, "object_image", None)
+        img = self.object_result
         if img is None:
             messagebox.showerror("오류", "편집할 사진이 없습니다.")
             return
@@ -812,10 +807,8 @@ class PhotoColorMatcherApp(tk.Tk):
         if work.shape[2] > 3:
             result = np.dstack([result, work[:, :, 3:]])
 
-        if hasattr(self, "object_working"):
-            self.object_working = result
-        elif hasattr(self, "object_image"):
-            self.object_image = result
+        self.object_history.append(self.object_result.copy())
+        self.object_result = result
 
         for name in ("refresh_object_canvas", "update_object_canvas", "render_object_canvas", "show_object_image"):
             fn = getattr(self, name, None)
@@ -832,53 +825,72 @@ class PhotoColorMatcherApp(tk.Tk):
             pass
 
     def object_canvas_click(self, event):
-        if getattr(self, "clone_source_mode", False) or getattr(self, "active_remove_tool", "") == "clone_source":
-            ix, iy = self._canvas_to_image(event.x, event.y)
-            self.clone_source = (int(ix), int(iy))
-            self.clone_source_point = self.clone_source
-            self.clone_source_mode = False
-            self._set_remove_tool_bindings("brush")
-            try: self.status_var.set(f"질감 원본 선택 완료: ({int(ix)}, {int(iy)})")
-            except Exception: pass
-            try: self.refresh_object_canvas()
-            except Exception: pass
+        if self.object_result is None:
+            return "break"
+        tool = self.active_remove_tool
+
+        if tool == "clone_source":
+            x, y = self._canvas_to_image(event.x, event.y)
+            h, w = self.object_result.shape[:2]
+            if 0 <= x < w and 0 <= y < h:
+                self.clone_source_point = (x, y)
+                self.clone_source_mode = False
+                self.clone_status_label.config(
+                    text=f"질감 복제 모드 · 원본 위치 ({x}, {y}) 선택됨"
+                )
+                self.activate_brush_mode()
+                self.refresh_object_canvas()
             return "break"
 
-        if self.object_result is None:
-            return
-        if self.object_select_mode:
+        if tool in ("rect", "ellipse"):
+            self.shape_select_start(event)
+            return "break"
+
+        if tool == "free":
             x, y = self._canvas_to_image(event.x, event.y)
             h, w = self.object_result.shape[:2]
             if not (0 <= x < w and 0 <= y < h):
-                return
+                return "break"
+            if not self.object_select_mode:
+                self.object_select_mode = True
+                self.object_select_points = []
             if len(self.object_select_points) >= 3:
                 fx, fy = self.object_select_points[0]
                 scale = max(self.object_display_scale, 1e-6)
                 close_dist = max(6, int(12 / scale))
                 if (x-fx)**2 + (y-fy)**2 <= close_dist**2:
                     self.finish_manual_selection()
-                    return
+                    return "break"
             self.object_select_points.append((x, y))
-            self.object_select_status.config(text=f"직접 선택 중 · {len(self.object_select_points)}개 점 · 시작점을 다시 클릭하면 완료")
+            self.object_select_status.config(
+                text=f"직접 선택 중 · {len(self.object_select_points)}개 점 · 시작점을 다시 클릭하거나 더블클릭하면 완료"
+            )
             self.refresh_object_canvas()
-            return
-        if self.clone_source_mode:
-            scale = self.object_display_scale
-            ox, oy = self.object_display_offset
-            x = int((event.x - ox) / max(scale, 1e-6))
-            y = int((event.y - oy) / max(scale, 1e-6))
-            h, w = self.object_result.shape[:2]
-            if 0 <= x < w and 0 <= y < h:
-                self.clone_source_point = (x, y)
-                self.clone_source_mode = False
-                self.clone_status_label.config(text=f"질감 복제 모드 · 원본 위치 ({x}, {y}) 선택됨 · 선택 영역 삭제 시 이 주변 질감 사용")
-                self.refresh_object_canvas()
-            return
-        self.paint_object_mask(event)
+            return "break"
+
+        if tool == "brush":
+            self.paint_object_mask(event)
+        return "break"
+
+    def object_canvas_drag(self, event):
+        tool = self.active_remove_tool
+        if tool in ("rect", "ellipse"):
+            self.shape_select_drag(event)
+        elif tool == "brush":
+            self.paint_object_mask(event)
+        return "break"
+
+    def object_canvas_release(self, event):
+        if self.active_remove_tool in ("rect", "ellipse"):
+            self.shape_select_end(event)
+        return "break"
 
     def show_brush_preview(self, event):
         """현재 브러시 크기를 마우스 위치에 빨간 원으로 표시."""
         if self.object_result is None:
+            return
+        if self.active_remove_tool != "brush":
+            self.hide_brush_preview()
             return
         if self.brush_preview_id is not None:
             try:
