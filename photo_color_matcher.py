@@ -3,7 +3,7 @@ import threading
 import traceback
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, colorchooser
 
 import cv2
 import numpy as np
@@ -195,6 +195,11 @@ def clone_texture_into_mask(bgr, mask, source_point, strength=70):
 
 class PhotoColorMatcherApp(tk.Tk):
     def __init__(self):
+
+        # V8.3 selection tool state
+        self.selection_tool = tk.StringVar(value="free")
+        self.shape_drag_start = None
+        self.shape_preview_id = None
         super().__init__()
         self.title(APP_TITLE)
         self.geometry("1080x760")
@@ -229,6 +234,9 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_display_photo = None
         self.object_display_scale = 1.0
         self.object_display_offset = (0, 0)
+        # V8.1 zoom/pan state: Ctrl+mouse wheel zooms around the cursor.
+        self.object_zoom = 1.0
+        self.object_zoom_center = None
         self.object_history = []
         self.brush_size = tk.DoubleVar(value=35)
         self.inpaint_radius = tk.DoubleVar(value=5)
@@ -248,6 +256,13 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_brightness = tk.DoubleVar(value=0)
 
         self._build_ui()
+        # V8.2: Ctrl +/- changes brush size anywhere in the app.        self.bind_all("<Escape>", lambda e: self.cancel_v83_selection())
+
+        self.bind_all("<Control-plus>", lambda e: self.adjust_brush_size_shortcut(+1))
+        self.bind_all("<Control-equal>", lambda e: self.adjust_brush_size_shortcut(+1))
+        self.bind_all("<Control-KP_Add>", lambda e: self.adjust_brush_size_shortcut(+1))
+        self.bind_all("<Control-minus>", lambda e: self.adjust_brush_size_shortcut(-1))
+        self.bind_all("<Control-KP_Subtract>", lambda e: self.adjust_brush_size_shortcut(-1))
         self.bind_all("<Control-s>", self._ctrl_save)
         self.bind_all("<Control-S>", self._ctrl_save)
 
@@ -351,7 +366,9 @@ class PhotoColorMatcherApp(tk.Tk):
         bar = ttk.Frame(wrap)
         bar.pack(fill="x")
         ttk.Button(bar, text="사진 열기", command=self.open_object_image).pack(side="left")
-        ttk.Button(bar, text="직접 영역 선택", command=self.activate_object_select).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="사각형 선택", command=lambda: self.set_selection_tool("rect")).pack(side="left", padx=3)
+        ttk.Button(bar, text="타원형 선택", command=lambda: self.set_selection_tool("ellipse")).pack(side="left", padx=3)
+        ttk.Button(bar, text="직접 선택", command=lambda: self.set_selection_tool("free")).pack(side="left", padx=3)
         ttk.Button(bar, text="브러시", command=self.activate_brush_mode).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="선택 색상 변경", command=self.apply_object_color).pack(side="left", padx=6)
         ttk.Button(bar, text="선택 영역 삭제", command=self.run_object_removal).pack(side="left", padx=6)
@@ -381,13 +398,9 @@ class PhotoColorMatcherApp(tk.Tk):
 
         color_opts = ttk.Frame(wrap)
         color_opts.pack(fill="x", pady=(0, 5))
-        ttk.Label(color_opts, text="선택 물체 색조").pack(side="left")
-        ttk.Scale(color_opts, from_=-180, to=180, variable=self.object_hue, length=150).pack(side="left", padx=5)
         ttk.Label(color_opts, text="채도").pack(side="left", padx=(8, 0))
-        ttk.Scale(color_opts, from_=-100, to=100, variable=self.object_saturation, length=130).pack(side="left", padx=5)
         ttk.Label(color_opts, text="밝기").pack(side="left", padx=(8, 0))
-        ttk.Scale(color_opts, from_=-100, to=100, variable=self.object_brightness, length=130).pack(side="left", padx=5)
-        self.object_select_status = ttk.Label(color_opts, text="브러시 모드 · 직접 영역 선택 버튼을 누르면 클릭으로 외곽선을 딸 수 있습니다.")
+        self.object_select_status = ttk.Label(color_opts, text="브러시 모드 · Ctrl+마우스 휠: 확대/축소 · 직접 영역 선택으로 외곽선을 딸 수 있습니다.")
         self.object_select_status.pack(side="left", padx=12)
 
         self.object_canvas = tk.Canvas(wrap, bg="#333333", highlightthickness=0, cursor="crosshair")
@@ -400,6 +413,9 @@ class PhotoColorMatcherApp(tk.Tk):
         self.bind_all("<Control-D>", self.activate_clone_source_mode)
         self.object_canvas.bind("<Motion>", self.show_brush_preview)
         self.object_canvas.bind("<Leave>", self.hide_brush_preview)
+        self.object_canvas.bind("<Control-MouseWheel>", self.object_canvas_zoom)
+        self.object_canvas.bind("<Control-Button-4>", lambda e: self.object_canvas_zoom(e, 1))
+        self.object_canvas.bind("<Control-Button-5>", lambda e: self.object_canvas_zoom(e, -1))
         self.object_canvas.bind("<Configure>", lambda e: self.refresh_object_canvas())
 
     def open_object_image(self):
@@ -424,6 +440,207 @@ class PhotoColorMatcherApp(tk.Tk):
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"사진을 열 수 없습니다.\n{e}")
 
+    def adjust_brush_size_shortcut(self, direction):
+        """Ctrl + Plus/Minus: change removal brush size."""
+        try:
+            current = int(float(self.brush_size.get()))
+        except Exception:
+            current = 20
+
+        step = 2 if current < 30 else 5
+        new_value = max(1, min(200, current + step * direction))
+        self.brush_size.set(new_value)
+
+        # Update the red brush preview immediately if the pointer is on the canvas.
+        try:
+            px, py = self.winfo_pointerxy()
+            cx = px - self.object_canvas.winfo_rootx()
+            cy = py - self.object_canvas.winfo_rooty()
+            if 0 <= cx < self.object_canvas.winfo_width() and 0 <= cy < self.object_canvas.winfo_height():
+                class _Evt:
+                    pass
+                evt = _Evt()
+                evt.x, evt.y = cx, cy
+                self.show_brush_preview(evt)
+        except Exception:
+            pass
+        return "break"
+
+    def cancel_v83_selection(self):
+        self.shape_drag_start = None
+        if self.shape_preview_id:
+            try:
+                self.object_canvas.delete(self.shape_preview_id)
+            except Exception:
+                pass
+            self.shape_preview_id = None
+        for name in ("selection_mask", "object_mask", "mask"):
+            if hasattr(self, name):
+                try:
+                    old = getattr(self, name)
+                    if isinstance(old, np.ndarray):
+                        setattr(self, name, np.zeros_like(old))
+                except Exception:
+                    pass
+        for name in ("refresh_object_canvas", "update_object_canvas", "render_object_canvas", "show_object_image"):
+            fn = getattr(self, name, None)
+            if callable(fn):
+                try: fn(); break
+                except Exception: pass
+        return "break"
+
+    def set_selection_tool(self, tool):
+        """Switch between rectangle, ellipse and free polygon selection."""
+        self.selection_tool.set(tool)
+        self.shape_drag_start = None
+        if self.shape_preview_id:
+            try:
+                self.object_canvas.delete(self.shape_preview_id)
+            except Exception:
+                pass
+            self.shape_preview_id = None
+
+        names = {"rect": "사각형 선택", "ellipse": "타원형 선택", "free": "직접 선택"}
+        try:
+            self.status_var.set(f"{names.get(tool, tool)} 도구가 선택되었습니다.")
+        except Exception:
+            pass
+
+        # Shape tools use drag. Free selection keeps the existing point-by-point behavior.
+        if tool in ("rect", "ellipse"):
+            self.object_canvas.bind("<ButtonPress-1>", self.shape_select_start)
+            self.object_canvas.bind("<B1-Motion>", self.shape_select_drag)
+            self.object_canvas.bind("<ButtonRelease-1>", self.shape_select_end)
+        else:
+            # Restore the app's existing manual polygon selection bindings.
+            try:
+                self.start_manual_selection()
+            except Exception:
+                pass
+
+    def _canvas_to_image_xy(self, x, y):
+        """Convert canvas coordinates to original-image coordinates, respecting V8.1 zoom."""
+        # Prefer existing conversion helper if this version has one.
+        for helper_name in ("canvas_to_image", "canvas_to_image_coords", "object_canvas_to_image"):
+            helper = getattr(self, helper_name, None)
+            if callable(helper):
+                try:
+                    return helper(x, y)
+                except Exception:
+                    pass
+
+        zoom = float(getattr(self, "object_zoom", getattr(self, "zoom_scale", 1.0)) or 1.0)
+        ox = float(getattr(self, "object_image_offset_x", getattr(self, "image_offset_x", 0)) or 0)
+        oy = float(getattr(self, "object_image_offset_y", getattr(self, "image_offset_y", 0)) or 0)
+        return int(round((x - ox) / zoom)), int(round((y - oy) / zoom))
+
+    def shape_select_start(self, event):
+        self.shape_drag_start = (event.x, event.y)
+        if self.shape_preview_id:
+            try: self.object_canvas.delete(self.shape_preview_id)
+            except Exception: pass
+        self.shape_preview_id = None
+
+    def shape_select_drag(self, event):
+        if not self.shape_drag_start:
+            return
+        x0, y0 = self.shape_drag_start
+        if self.shape_preview_id:
+            try: self.object_canvas.delete(self.shape_preview_id)
+            except Exception: pass
+        kwargs = dict(outline="#00ff55", width=2, dash=(5, 3))
+        if self.selection_tool.get() == "ellipse":
+            self.shape_preview_id = self.object_canvas.create_oval(x0, y0, event.x, event.y, **kwargs)
+        else:
+            self.shape_preview_id = self.object_canvas.create_rectangle(x0, y0, event.x, event.y, **kwargs)
+
+    def shape_select_end(self, event):
+        if not self.shape_drag_start:
+            return
+        x0, y0 = self.shape_drag_start
+        x1, y1 = event.x, event.y
+        self.shape_drag_start = None
+
+        ix0, iy0 = self._canvas_to_image_xy(x0, y0)
+        ix1, iy1 = self._canvas_to_image_xy(x1, y1)
+        left, right = sorted((ix0, ix1))
+        top, bottom = sorted((iy0, iy1))
+        if right - left < 2 or bottom - top < 2:
+            return
+
+        # Determine original image size.
+        img = getattr(self, "object_working", None)
+        if img is None:
+            img = getattr(self, "object_image", None)
+        if img is None:
+            img = getattr(self, "current_image", None)
+        if img is None:
+            return
+
+        h, w = img.shape[:2]
+        left, right = max(0, left), min(w - 1, right)
+        top, bottom = max(0, top), min(h - 1, bottom)
+
+        mask = np.zeros((h, w), dtype=np.uint8)
+        if self.selection_tool.get() == "ellipse":
+            cx, cy = (left + right) // 2, (top + bottom) // 2
+            ax, ay = max(1, (right-left)//2), max(1, (bottom-top)//2)
+            cv2.ellipse(mask, (cx, cy), (ax, ay), 0, 0, 360, 255, -1)
+        else:
+            cv2.rectangle(mask, (left, top), (right, bottom), 255, -1)
+
+        # Store under the mask attribute used by this app.
+        stored = False
+        for name in ("selection_mask", "object_mask", "mask"):
+            if hasattr(self, name):
+                setattr(self, name, mask)
+                stored = True
+                break
+        if not stored:
+            self.selection_mask = mask
+
+        # Refresh overlay using whichever renderer exists.
+        for name in ("refresh_object_canvas", "update_object_canvas", "render_object_canvas", "show_object_image"):
+            fn = getattr(self, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                    break
+                except Exception:
+                    pass
+
+        try:
+            self.status_var.set("선택 완료 — 색상 변경, 영역 삭제 또는 질감 복제를 사용할 수 있습니다.")
+        except Exception:
+            pass
+
+    def object_canvas_zoom(self, event, linux_direction=None):
+        """Ctrl+wheel zoom. Keep the image point under the mouse approximately fixed."""
+        if self.object_result is None:
+            return "break"
+
+        if linux_direction is not None:
+            direction = linux_direction
+        else:
+            direction = 1 if getattr(event, "delta", 0) > 0 else -1
+
+        old_zoom = self.object_zoom
+        factor = 1.20 if direction > 0 else (1 / 1.20)
+        new_zoom = max(1.0, min(8.0, old_zoom * factor))
+        if abs(new_zoom - old_zoom) < 1e-9:
+            return "break"
+
+        # Save the image coordinate currently below the mouse cursor.
+        try:
+            ix, iy = self._canvas_to_image(event.x, event.y)
+            self.object_zoom_center = (ix, iy, event.x, event.y)
+        except Exception:
+            self.object_zoom_center = None
+
+        self.object_zoom = new_zoom
+        self.refresh_object_canvas()
+        return "break"
+
     def refresh_object_canvas(self):
         if self.object_result is None or not hasattr(self, "object_canvas"):
             return
@@ -431,9 +648,27 @@ class PhotoColorMatcherApp(tk.Tk):
         cw = max(100, self.object_canvas.winfo_width())
         ch = max(100, self.object_canvas.winfo_height())
         h, w = self.object_result.shape[:2]
-        scale = min(cw / w, ch / h, 1.0)
+        fit_scale = min(cw / w, ch / h, 1.0)
+        scale = fit_scale * self.object_zoom
         dw, dh = max(1, int(w * scale)), max(1, int(h * scale))
-        ox, oy = (cw - dw)//2, (ch - dh)//2
+
+        # At 100%, center the image. While zooming, anchor the image point under the cursor.
+        if self.object_zoom_center is not None and self.object_zoom > 1.0:
+            ix, iy, cx, cy = self.object_zoom_center
+            ox = int(cx - ix * scale)
+            oy = int(cy - iy * scale)
+            # Prevent losing the image completely outside the viewport.
+            if dw > cw:
+                ox = min(0, max(cw - dw, ox))
+            else:
+                ox = (cw - dw) // 2
+            if dh > ch:
+                oy = min(0, max(ch - dh, oy))
+            else:
+                oy = (ch - dh) // 2
+        else:
+            ox, oy = (cw - dw)//2, (ch - dh)//2
+
         self.object_display_scale = scale
         self.object_display_offset = (ox, oy)
 
@@ -540,29 +775,87 @@ class PhotoColorMatcherApp(tk.Tk):
         return
 
     def apply_object_color(self):
-        """Change hue/saturation/brightness only inside the selected object."""
-        if self.object_result is None or self.object_edit_mask is None or not np.any(self.object_edit_mask):
-            messagebox.showwarning(APP_TITLE, "먼저 '물체 자동 선택'으로 물체를 선택해주세요.")
+        """Open a Photoshop-like system color picker and recolor the selected object."""
+        # Find the active selection mask.
+        mask = None
+        for name in ("selection_mask", "object_mask", "mask"):
+            candidate = getattr(self, name, None)
+            if isinstance(candidate, np.ndarray) and candidate.size and np.any(candidate > 0):
+                mask = candidate
+                break
+
+        if mask is None:
+            messagebox.showinfo("선택 필요", "먼저 색상을 변경할 영역을 선택해주세요.")
             return
-        self.object_history.append(self.object_result.copy())
-        hsv = cv2.cvtColor(self.object_result, cv2.COLOR_BGR2HSV).astype(np.float32)
-        m = self.object_edit_mask > 0
-        hue = float(self.object_hue.get()) / 2.0  # OpenCV hue 0..179
-        sat = float(self.object_saturation.get())
-        val = float(self.object_brightness.get())
-        hsv[...,0][m] = (hsv[...,0][m] + hue) % 180.0
-        if sat >= 0:
-            hsv[...,1][m] += (255.0 - hsv[...,1][m]) * (sat / 100.0)
-        else:
-            hsv[...,1][m] *= (1.0 + sat / 100.0)
-        if val >= 0:
-            hsv[...,2][m] += (255.0 - hsv[...,2][m]) * (val / 100.0)
-        else:
-            hsv[...,2][m] *= (1.0 + val / 100.0)
-        hsv = np.clip(hsv, 0, 255).astype(np.uint8)
-        self.object_result = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-        self.object_select_status.config(text="선택한 물체의 색상을 변경했습니다. 필요하면 값을 바꿔 다시 적용할 수 있습니다.")
-        self.refresh_object_canvas()
+
+        # Start from the previously selected color when available.
+        initial = getattr(self, "selected_object_color_hex", "#ff6600")
+        picked = colorchooser.askcolor(color=initial, title="선택 물체 색상")
+        if not picked or not picked[1]:
+            return
+        rgb, hex_color = picked
+        self.selected_object_color_hex = hex_color
+
+        img = getattr(self, "object_working", None)
+        if img is None:
+            img = getattr(self, "object_image", None)
+        if img is None:
+            messagebox.showerror("오류", "편집할 사진이 없습니다.")
+            return
+
+        # Preserve original luminance/texture while replacing hue/chroma toward chosen color.
+        work = img.copy()
+        if work.ndim != 3 or work.shape[2] < 3:
+            messagebox.showerror("오류", "지원되지 않는 이미지 형식입니다.")
+            return
+
+        target_rgb = np.uint8([[list(map(int, rgb))]])
+        target_bgr = cv2.cvtColor(target_rgb, cv2.COLOR_RGB2BGR)[0, 0]
+        target_hsv = cv2.cvtColor(np.uint8([[target_bgr]]), cv2.COLOR_BGR2HSV)[0, 0]
+
+        hsv = cv2.cvtColor(work[:, :, :3], cv2.COLOR_BGR2HSV)
+        selected = mask > 0
+
+        # Replace hue strongly, blend saturation so surface detail remains natural.
+        hsv2 = hsv.copy()
+        hsv2[..., 0][selected] = target_hsv[0]
+        orig_s = hsv[..., 1].astype(np.float32)
+        target_s = float(target_hsv[1])
+        hsv2[..., 1][selected] = np.clip(
+            orig_s[selected] * 0.35 + target_s * 0.65, 0, 255
+        ).astype(np.uint8)
+        # Value/brightness is intentionally preserved to retain shadows and texture.
+
+        recolored = cv2.cvtColor(hsv2, cv2.COLOR_HSV2BGR)
+
+        # Feather only the mask edge slightly; the interior stays sharp.
+        soft = cv2.GaussianBlur(mask, (0, 0), 0.8).astype(np.float32) / 255.0
+        alpha = soft[..., None]
+        result = (work[:, :, :3].astype(np.float32) * (1.0 - alpha) +
+                  recolored.astype(np.float32) * alpha).clip(0, 255).astype(np.uint8)
+
+        if work.shape[2] > 3:
+            result = np.dstack([result, work[:, :, 3:]])
+
+        if hasattr(self, "object_working"):
+            self.object_working = result
+        elif hasattr(self, "object_image"):
+            self.object_image = result
+
+        for name in ("refresh_object_canvas", "update_object_canvas", "render_object_canvas", "show_object_image"):
+            fn = getattr(self, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                    break
+                except Exception:
+                    pass
+
+        try:
+            self.status_var.set(f"선택 영역 색상을 {hex_color}로 변경했습니다.")
+        except Exception:
+            pass
+
 
     def object_canvas_click(self, event):
         if self.object_result is None:
