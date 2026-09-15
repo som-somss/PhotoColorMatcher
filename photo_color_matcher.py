@@ -224,8 +224,22 @@ class PhotoColorMatcherApp(tk.Tk):
         self.add_slider(controls, "선명도", self.sharpness, -100, 100)
 
         ttk.Button(controls, text="세부값 초기화", command=self.reset_adjustments).pack(fill="x", pady=(8, 4))
+
+        # 저장 버튼은 항상 보이도록 세부 보정 패널 안에 고정 배치
+        ttk.Button(
+            controls,
+            text="현재 사진 저장 (Ctrl+S)",
+            command=self.save_current_color_result
+        ).pack(fill="x", pady=(6, 3))
+
+        ttk.Button(
+            controls,
+            text="전체 사진 일괄 저장",
+            command=self.start_processing
+        ).pack(fill="x", pady=(3, 5))
+
         ttk.Checkbutton(controls, text="폴더 추가 시 하위 폴더 구조 유지",
-                        variable=self.keep_subfolders).pack(anchor="w", pady=(6, 0))
+                        variable=self.keep_subfolders).pack(anchor="w", pady=(4, 0))
 
         preview = ttk.LabelFrame(body, text="미리보기", padding=8)
         preview.pack(side="left", fill="both", expand=True, padx=(8, 0))
@@ -250,10 +264,6 @@ class PhotoColorMatcherApp(tk.Tk):
         self.progress.pack(fill="x")
         self.status = ttk.Label(bottom, text="준비됨")
         self.status.pack(anchor="w", pady=(4, 4))
-        savebar = ttk.Frame(bottom)
-        savebar.pack(fill="x", pady=(4, 4))
-        ttk.Button(savebar, text="현재 보정 결과 저장 (Ctrl+S)", command=self.save_current_color_result).pack(side="left", fill="x", expand=True)
-        ttk.Button(savebar, text="전체 일괄 저장", command=self.start_processing).pack(side="left", fill="x", expand=True, padx=(8, 0))
 
         self._build_remove_tab(remove_tab)
 
