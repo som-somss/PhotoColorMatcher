@@ -152,6 +152,47 @@ def remove_masked_object(bgr, mask, radius=5, strength=70):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def clone_texture_into_mask(bgr, mask, source_point, strength=70):
+    """
+    선택한 source_point 주변의 색/질감을 마스크 영역으로 평행 이동하여 복제.
+    마스크 중심과 source_point 사이의 오프셋을 유지하므로 Clone Stamp처럼 동작한다.
+    """
+    if mask is None or not np.any(mask) or source_point is None:
+        return bgr.copy()
+
+    ys, xs = np.where(mask > 0)
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    cx = int(round((x0 + x1) / 2))
+    cy = int(round((y0 + y1) / 2))
+    sx, sy = map(int, source_point)
+
+    h, w = bgr.shape[:2]
+    dx = sx - cx
+    dy = sy - cy
+
+    # 목적지 각 픽셀에 대응하는 원본 좌표를 만든다.
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    map_x = np.clip(xx + dx, 0, w - 1).astype(np.float32)
+    map_y = np.clip(yy + dy, 0, h - 1).astype(np.float32)
+    cloned = cv2.remap(bgr, map_x, map_y, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+
+    mask8 = np.where(mask > 0, 255, 0).astype(np.uint8)
+    # 강도가 높을수록 가장자리까지 더 확실히 덮고, 낮으면 더 부드럽게 혼합
+    s = float(np.clip(strength, 0, 100)) / 100.0
+    sigma = 2.5 - 1.8 * s
+    feather = cv2.GaussianBlur(mask8, (0, 0), max(0.55, sigma)).astype(np.float32) / 255.0
+    feather = feather[..., None]
+
+    # 복제 질감의 미세 선명도 강화
+    blur = cv2.GaussianBlur(cloned, (0, 0), 0.9)
+    amount = 0.15 + 0.85 * s
+    cloned_sharp = cv2.addWeighted(cloned, 1.0 + amount, blur, -amount, 0)
+
+    out = bgr.astype(np.float32) * (1.0 - feather) + cloned_sharp.astype(np.float32) * feather
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 class PhotoColorMatcherApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -193,6 +234,9 @@ class PhotoColorMatcherApp(tk.Tk):
         self.inpaint_radius = tk.DoubleVar(value=5)
         self.remove_strength = tk.DoubleVar(value=70)
         self.brush_preview_id = None
+        self.clone_source_mode = False
+        self.clone_source_point = None
+        self.clone_source_marker_id = None
 
         self._build_ui()
         self.bind_all("<Control-s>", self._ctrl_save)
@@ -302,6 +346,8 @@ class PhotoColorMatcherApp(tk.Tk):
         ttk.Button(bar, text="마스크 지우기", command=self.clear_object_mask).pack(side="left")
         ttk.Button(bar, text="실행 취소", command=self.undo_object_removal).pack(side="left", padx=6)
         ttk.Button(bar, text="원본 복원", command=self.restore_object_original).pack(side="left")
+        ttk.Button(bar, text="질감 원본 선택 (Ctrl+D)", command=self.activate_clone_source_mode).pack(side="left", padx=(12, 0))
+        ttk.Button(bar, text="질감 선택 해제", command=self.clear_clone_source).pack(side="left", padx=6)
         ttk.Button(bar, text="결과 저장", command=self.save_object_result).pack(side="right")
 
         opts = ttk.Frame(wrap)
@@ -315,12 +361,18 @@ class PhotoColorMatcherApp(tk.Tk):
         self.remove_strength_label = ttk.Label(opts, text="70", width=4)
         self.remove_strength_label.pack(side="left")
         self.remove_strength.trace_add("write", lambda *_: self.remove_strength_label.config(text=str(int(self.remove_strength.get()))))
-        ttk.Label(opts, text="삭제할 물체를 칠한 뒤 '선택 영역 삭제'를 누르세요.").pack(side="left", padx=12)
+        self.clone_status_label = ttk.Label(
+            opts,
+            text="자동 복원 모드 · Ctrl+D → 사진의 질감 원본 클릭 시 복제 모드",
+        )
+        self.clone_status_label.pack(side="left", padx=12)
 
         self.object_canvas = tk.Canvas(wrap, bg="#333333", highlightthickness=0, cursor="crosshair")
         self.object_canvas.pack(fill="both", expand=True)
-        self.object_canvas.bind("<Button-1>", self.paint_object_mask)
+        self.object_canvas.bind("<Button-1>", self.object_canvas_click)
         self.object_canvas.bind("<B1-Motion>", self.paint_object_mask)
+        self.root.bind_all("<Control-d>", self.activate_clone_source_mode)
+        self.root.bind_all("<Control-D>", self.activate_clone_source_mode)
         self.object_canvas.bind("<Motion>", self.show_brush_preview)
         self.object_canvas.bind("<Leave>", self.hide_brush_preview)
         self.object_canvas.bind("<Configure>", lambda e: self.refresh_object_canvas())
@@ -336,6 +388,10 @@ class PhotoColorMatcherApp(tk.Tk):
             self.object_result = bgr.copy()
             self.object_mask = np.zeros(bgr.shape[:2], dtype=np.uint8)
             self.object_history = []
+            self.clone_source_mode = False
+            self.clone_source_point = None
+            if hasattr(self, "clone_status_label"):
+                self.clone_status_label.config(text="자동 복원 모드 · Ctrl+D → 사진의 질감 원본 클릭 시 복제 모드")
             self.refresh_object_canvas()
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"사진을 열 수 없습니다.\n{e}")
@@ -366,6 +422,49 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_display_photo = ImageTk.PhotoImage(im)
         self.object_canvas.delete("all")
         self.object_canvas.create_image(ox, oy, anchor="nw", image=self.object_display_photo)
+
+        # 선택한 질감 원본 위치를 화면에 십자표시
+        if self.clone_source_point is not None:
+            sx, sy = self.clone_source_point
+            cx = ox + sx * scale
+            cy = oy + sy * scale
+            r = 10
+            self.object_canvas.create_oval(cx-r, cy-r, cx+r, cy+r, outline="#00e5ff", width=2)
+            self.object_canvas.create_line(cx-r-5, cy, cx+r+5, cy, fill="#00e5ff", width=2)
+            self.object_canvas.create_line(cx, cy-r-5, cx, cy+r+5, fill="#00e5ff", width=2)
+
+    def activate_clone_source_mode(self, event=None):
+        """Ctrl+D 후 다음 클릭 위치를 질감/색상 원본으로 지정."""
+        if self.object_result is None:
+            messagebox.showwarning(APP_TITLE, "먼저 사진을 열어주세요.")
+            return "break"
+        self.clone_source_mode = True
+        self.clone_status_label.config(text="질감 원본 선택 중: 사진에서 가져올 부분을 한 번 클릭하세요.")
+        return "break"
+
+    def clear_clone_source(self):
+        self.clone_source_mode = False
+        self.clone_source_point = None
+        if hasattr(self, "clone_status_label"):
+            self.clone_status_label.config(text="자동 복원 모드 · Ctrl+D → 사진의 질감 원본 클릭 시 복제 모드")
+        self.refresh_object_canvas()
+
+    def object_canvas_click(self, event):
+        if self.clone_source_mode:
+            scale = self.object_display_scale
+            ox, oy = self.object_display_offset
+            x = int((event.x - ox) / max(scale, 1e-6))
+            y = int((event.y - oy) / max(scale, 1e-6))
+            h, w = self.object_result.shape[:2]
+            if 0 <= x < w and 0 <= y < h:
+                self.clone_source_point = (x, y)
+                self.clone_source_mode = False
+                self.clone_status_label.config(
+                    text=f"질감 복제 모드 · 원본 위치 ({x}, {y}) 선택됨 · 선택 영역 삭제 시 이 주변 질감 사용"
+                )
+                self.refresh_object_canvas()
+            return
+        self.paint_object_mask(event)
 
     def show_brush_preview(self, event):
         """현재 브러시 크기를 마우스 위치에 빨간 원으로 표시."""
@@ -420,12 +519,22 @@ class PhotoColorMatcherApp(tk.Tk):
             messagebox.showwarning(APP_TITLE, "삭제할 물체를 먼저 마우스로 칠해주세요.")
             return
         self.object_history.append(self.object_result.copy())
-        self.object_result = remove_masked_object(
-            self.object_result,
-            self.object_mask,
-            int(round(self.inpaint_radius.get())),
-            int(round(self.remove_strength.get()))
-        )
+
+        if self.clone_source_point is not None:
+            self.object_result = clone_texture_into_mask(
+                self.object_result,
+                self.object_mask,
+                self.clone_source_point,
+                int(round(self.remove_strength.get()))
+            )
+        else:
+            self.object_result = remove_masked_object(
+                self.object_result,
+                self.object_mask,
+                int(round(self.inpaint_radius.get())),
+                int(round(self.remove_strength.get()))
+            )
+
         self.object_mask[:] = 0
         self.refresh_object_canvas()
 
