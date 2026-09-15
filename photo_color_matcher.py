@@ -1,6 +1,4 @@
-
 import os
-import sys
 import threading
 import traceback
 from pathlib import Path
@@ -9,14 +7,13 @@ from tkinter import ttk, filedialog, messagebox
 
 import cv2
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageTk, ImageEnhance
 
-APP_TITLE = "Photo Color Matcher"
-
+APP_TITLE = "Photo Color Matcher Pro"
 SUPPORTED = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
+
 def read_image(path):
-    """Unicode-safe image read with EXIF orientation applied."""
     path = str(path)
     with Image.open(path) as im:
         exif = im.getexif()
@@ -24,15 +21,13 @@ def read_image(path):
         dpi = im.info.get("dpi")
         im = ImageOps.exif_transpose(im).convert("RGB")
         arr = np.array(im)
-    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    return bgr, exif, icc, dpi
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR), exif, icc, dpi
+
 
 def save_image(path, bgr, exif=None, icc=None, dpi=None, jpeg_quality=95):
-    """Save via Pillow for Unicode paths and metadata retention where possible."""
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     im = Image.fromarray(rgb)
     ext = Path(path).suffix.lower()
-
     kwargs = {}
     if exif:
         try:
@@ -43,241 +38,374 @@ def save_image(path, bgr, exif=None, icc=None, dpi=None, jpeg_quality=95):
         kwargs["icc_profile"] = icc
     if dpi:
         kwargs["dpi"] = dpi
-
     if ext in {".jpg", ".jpeg"}:
         kwargs.update(quality=jpeg_quality, subsampling=0)
     elif ext == ".png":
         kwargs.update(compress_level=3)
-
     im.save(path, **kwargs)
+
 
 def lab_stats(bgr):
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    mean, std = cv2.meanStdDev(lab)
-    return mean.reshape(3), std.reshape(3)
+    return cv2.meanStdDev(lab)[0].reshape(3), cv2.meanStdDev(lab)[1].reshape(3)
 
-def color_transfer(source_bgr, ref_mean, ref_std, strength=1.0):
-    """
-    Reinhard-style color transfer in LAB.
-    strength 0..1 blends original and matched result.
-    """
+
+def color_transfer(source_bgr, ref_mean, ref_std, strength=0.85):
     lab = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    flat = lab.reshape(-1, 3)
-    src_mean = flat.mean(axis=0)
-    src_std = flat.std(axis=0)
+    src_mean, src_std = cv2.meanStdDev(lab)
+    src_mean, src_std = src_mean.reshape(3), src_std.reshape(3)
     src_std = np.maximum(src_std, 1e-6)
 
-    matched = (lab - src_mean) * (ref_std / src_std) + ref_mean
-    matched = np.clip(matched, 0, 255)
+    out = lab.copy()
+    for c in range(3):
+        out[:, :, c] = (lab[:, :, c] - src_mean[c]) * (ref_std[c] / src_std[c]) + ref_mean[c]
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    matched = cv2.cvtColor(out, cv2.COLOR_LAB2BGR)
+    return cv2.addWeighted(source_bgr, 1.0 - strength, matched, strength, 0)
 
-    if strength < 1.0:
-        matched = lab * (1.0 - strength) + matched * strength
 
-    matched = np.clip(matched, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(matched, cv2.COLOR_LAB2BGR)
+def apply_manual_adjustments(bgr, brightness=0, contrast=0, saturation=0,
+                             temperature=0, tint=0, highlights=0, shadows=0,
+                             sharpness=0):
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    im = Image.fromarray(rgb)
 
-class App(tk.Tk):
+    if brightness:
+        im = ImageEnhance.Brightness(im).enhance(max(0.05, 1.0 + brightness / 100.0))
+    if contrast:
+        im = ImageEnhance.Contrast(im).enhance(max(0.05, 1.0 + contrast / 100.0))
+    if saturation:
+        im = ImageEnhance.Color(im).enhance(max(0.0, 1.0 + saturation / 100.0))
+
+    arr = np.asarray(im).astype(np.float32)
+
+    # Temperature: + = warmer, - = cooler
+    t = temperature / 100.0
+    arr[:, :, 0] *= (1.0 + 0.18 * t)
+    arr[:, :, 2] *= (1.0 - 0.18 * t)
+
+    # Tint: + = magenta, - = green
+    ti = tint / 100.0
+    arr[:, :, 0] *= (1.0 + 0.07 * ti)
+    arr[:, :, 2] *= (1.0 + 0.07 * ti)
+    arr[:, :, 1] *= (1.0 - 0.12 * ti)
+
+    arr = np.clip(arr, 0, 255)
+
+    # Tonal adjustments with smooth luminance masks
+    lum = (0.2126 * arr[:, :, 0] + 0.7152 * arr[:, :, 1] + 0.0722 * arr[:, :, 2]) / 255.0
+    if shadows:
+        mask = np.clip((0.65 - lum) / 0.65, 0, 1)[..., None]
+        amount = shadows / 100.0
+        if amount >= 0:
+            arr += (255.0 - arr) * mask * (0.35 * amount)
+        else:
+            arr *= 1.0 + mask * (0.35 * amount)
+
+    if highlights:
+        mask = np.clip((lum - 0.35) / 0.65, 0, 1)[..., None]
+        amount = highlights / 100.0
+        if amount >= 0:
+            arr += (255.0 - arr) * mask * (0.25 * amount)
+        else:
+            arr *= 1.0 + mask * (0.35 * amount)
+
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    im = Image.fromarray(arr)
+
+    if sharpness:
+        im = ImageEnhance.Sharpness(im).enhance(max(0.0, 1.0 + sharpness / 50.0))
+
+    return cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
+
+
+class PhotoColorMatcherApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("760x560")
-        self.minsize(700, 520)
+        self.geometry("1080x760")
+        self.minsize(900, 680)
 
-        self.reference = tk.StringVar()
+        self.ref_path = tk.StringVar()
         self.output_dir = tk.StringVar(value=str(Path.cwd() / "matched_output"))
-        self.strength = tk.DoubleVar(value=85)
         self.keep_subfolders = tk.BooleanVar(value=True)
         self.files = []
-        self.running = False
 
-        self._build()
+        self.match_strength = tk.DoubleVar(value=85)
+        self.brightness = tk.DoubleVar(value=0)
+        self.contrast = tk.DoubleVar(value=0)
+        self.saturation = tk.DoubleVar(value=0)
+        self.temperature = tk.DoubleVar(value=0)
+        self.tint = tk.DoubleVar(value=0)
+        self.highlights = tk.DoubleVar(value=0)
+        self.shadows = tk.DoubleVar(value=0)
+        self.sharpness = tk.DoubleVar(value=0)
 
-    def _build(self):
+        self.preview_src = None
+        self.preview_ref = None
+        self.preview_photo_before = None
+        self.preview_photo_after = None
+        self._preview_job = None
+
+        self._build_ui()
+
+    def _build_ui(self):
         pad = 10
+        top = ttk.Frame(self, padding=pad)
+        top.pack(fill="both", expand=True)
 
-        frm = ttk.Frame(self, padding=12)
-        frm.pack(fill="both", expand=True)
+        ref = ttk.LabelFrame(top, text="기준 사진", padding=8)
+        ref.pack(fill="x")
+        ttk.Entry(ref, textvariable=self.ref_path).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(ref, text="기준 사진 선택", command=self.choose_reference).pack(side="left")
 
-        ttk.Label(frm, text="기준 사진").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.reference).grid(row=1, column=0, sticky="ew", padx=(0,8))
-        ttk.Button(frm, text="기준 사진 선택", command=self.pick_reference).grid(row=1, column=1, sticky="ew")
+        targets = ttk.LabelFrame(top, text="보정할 사진", padding=8)
+        targets.pack(fill="x", pady=(8, 0))
+        btns = ttk.Frame(targets)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="파일 추가", command=self.add_files).pack(side="left")
+        ttk.Button(btns, text="폴더 추가", command=self.add_folder).pack(side="left", padx=6)
+        ttk.Button(btns, text="목록 비우기", command=self.clear_files).pack(side="left")
+        self.listbox = tk.Listbox(targets, height=5)
+        self.listbox.pack(fill="x", pady=(6, 0))
+        self.listbox.bind("<<ListboxSelect>>", lambda e: self.schedule_preview())
 
-        ttk.Separator(frm).grid(row=2, column=0, columnspan=2, sticky="ew", pady=12)
+        out = ttk.LabelFrame(top, text="출력 폴더", padding=8)
+        out.pack(fill="x", pady=(8, 0))
+        ttk.Entry(out, textvariable=self.output_dir).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(out, text="폴더 선택", command=self.choose_output).pack(side="left")
 
-        ttk.Label(frm, text="보정할 사진").grid(row=3, column=0, sticky="w")
-        buttons = ttk.Frame(frm)
-        buttons.grid(row=4, column=0, columnspan=2, sticky="w")
-        ttk.Button(buttons, text="파일 추가", command=self.add_files).pack(side="left", padx=(0,6))
-        ttk.Button(buttons, text="폴더 추가", command=self.add_folder).pack(side="left", padx=(0,6))
-        ttk.Button(buttons, text="목록 비우기", command=self.clear_files).pack(side="left")
+        body = ttk.Frame(top)
+        body.pack(fill="both", expand=True, pady=(8, 0))
 
-        self.listbox = tk.Listbox(frm, height=10, selectmode="extended")
-        self.listbox.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(6,10))
+        controls = ttk.LabelFrame(body, text="세부 보정", padding=8)
+        controls.pack(side="left", fill="y")
 
-        ttk.Label(frm, text="출력 폴더").grid(row=6, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.output_dir).grid(row=7, column=0, sticky="ew", padx=(0,8))
-        ttk.Button(frm, text="폴더 선택", command=self.pick_output).grid(row=7, column=1, sticky="ew")
+        self.add_slider(controls, "색감 매칭 강도", self.match_strength, 0, 100, "%")
+        ttk.Separator(controls).pack(fill="x", pady=5)
+        self.add_slider(controls, "밝기", self.brightness, -100, 100)
+        self.add_slider(controls, "대비", self.contrast, -100, 100)
+        self.add_slider(controls, "채도", self.saturation, -100, 100)
+        self.add_slider(controls, "색온도", self.temperature, -100, 100)
+        self.add_slider(controls, "틴트", self.tint, -100, 100)
+        self.add_slider(controls, "하이라이트", self.highlights, -100, 100)
+        self.add_slider(controls, "그림자", self.shadows, -100, 100)
+        self.add_slider(controls, "선명도", self.sharpness, -100, 100)
 
-        options = ttk.LabelFrame(frm, text="옵션", padding=10)
-        options.grid(row=8, column=0, columnspan=2, sticky="ew", pady=12)
-        ttk.Label(options, text="색감 매칭 강도").grid(row=0, column=0, sticky="w")
-        ttk.Scale(options, from_=0, to=100, variable=self.strength, orient="horizontal",
-                  command=self._update_strength_label).grid(row=0, column=1, sticky="ew", padx=8)
-        self.strength_label = ttk.Label(options, text="85%")
-        self.strength_label.grid(row=0, column=2, sticky="e")
-        ttk.Checkbutton(options, text="폴더 추가 시 하위 폴더 구조 유지", variable=self.keep_subfolders)\
-            .grid(row=1, column=0, columnspan=3, sticky="w", pady=(8,0))
-        options.columnconfigure(1, weight=1)
+        ttk.Button(controls, text="세부값 초기화", command=self.reset_adjustments).pack(fill="x", pady=(8, 4))
+        ttk.Checkbutton(controls, text="폴더 추가 시 하위 폴더 구조 유지",
+                        variable=self.keep_subfolders).pack(anchor="w", pady=(6, 0))
 
-        self.progress = ttk.Progressbar(frm, mode="determinate")
-        self.progress.grid(row=9, column=0, columnspan=2, sticky="ew")
+        preview = ttk.LabelFrame(body, text="미리보기", padding=8)
+        preview.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        pv = ttk.Frame(preview)
+        pv.pack(fill="both", expand=True)
 
-        self.status = ttk.Label(frm, text="준비됨")
-        self.status.grid(row=10, column=0, columnspan=2, sticky="w", pady=(6,8))
+        left = ttk.Frame(pv)
+        left.pack(side="left", fill="both", expand=True)
+        ttk.Label(left, text="원본").pack()
+        self.before_label = ttk.Label(left, anchor="center")
+        self.before_label.pack(fill="both", expand=True, padx=4, pady=4)
 
-        self.run_btn = ttk.Button(frm, text="자동 색감 보정 시작", command=self.start)
-        self.run_btn.grid(row=11, column=0, columnspan=2, sticky="ew", ipady=6)
+        right = ttk.Frame(pv)
+        right.pack(side="left", fill="both", expand=True)
+        ttk.Label(right, text="보정 결과").pack()
+        self.after_label = ttk.Label(right, anchor="center")
+        self.after_label.pack(fill="both", expand=True, padx=4, pady=4)
 
-        frm.columnconfigure(0, weight=1)
-        frm.rowconfigure(5, weight=1)
+        bottom = ttk.Frame(top)
+        bottom.pack(fill="x", pady=(8, 0))
+        self.progress = ttk.Progressbar(bottom, mode="determinate")
+        self.progress.pack(fill="x")
+        self.status = ttk.Label(bottom, text="준비됨")
+        self.status.pack(anchor="w", pady=(4, 4))
+        ttk.Button(bottom, text="자동 색감 보정 시작", command=self.start_processing).pack(fill="x", ipady=8)
 
-    def _update_strength_label(self, _=None):
-        self.strength_label.config(text=f"{int(self.strength.get())}%")
+    def add_slider(self, parent, label, var, lo, hi, suffix=""):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text=label, width=15).pack(side="left")
+        scale = ttk.Scale(row, from_=lo, to=hi, variable=var, length=230,
+                          command=lambda _=None: self.schedule_preview())
+        scale.pack(side="left", padx=5)
+        value = ttk.Label(row, width=6, anchor="e")
+        value.pack(side="left")
 
-    def pick_reference(self):
-        p = filedialog.askopenfilename(
-            title="기준 사진 선택",
-            filetypes=[("이미지", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp"), ("모든 파일", "*.*")]
-        )
+        def update_label(*_):
+            value.config(text=f"{int(round(var.get()))}{suffix}")
+        var.trace_add("write", update_label)
+        update_label()
+
+    def choose_reference(self):
+        p = filedialog.askopenfilename(filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp")])
         if p:
-            self.reference.set(p)
+            self.ref_path.set(p)
+            self.schedule_preview()
 
     def add_files(self):
-        paths = filedialog.askopenfilenames(
-            title="보정할 사진 선택",
-            filetypes=[("이미지", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp"), ("모든 파일", "*.*")]
-        )
-        self._append_files(paths)
+        fs = filedialog.askopenfilenames(filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp")])
+        self._append_files(fs)
 
     def add_folder(self):
-        folder = filedialog.askdirectory(title="사진 폴더 선택")
+        folder = filedialog.askdirectory()
         if not folder:
             return
-        folder = Path(folder)
-        paths = [str(p) for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED]
+        paths = [str(p) for p in Path(folder).rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED]
         self._append_files(paths)
 
     def _append_files(self, paths):
         existing = set(self.files)
         for p in paths:
-            if p not in existing and Path(p).suffix.lower() in SUPPORTED:
+            if p not in existing:
                 self.files.append(p)
                 self.listbox.insert("end", p)
                 existing.add(p)
+        if self.files and not self.listbox.curselection():
+            self.listbox.selection_set(0)
+        self.schedule_preview()
 
     def clear_files(self):
         self.files.clear()
         self.listbox.delete(0, "end")
+        self.before_label.config(image="")
+        self.after_label.config(image="")
 
-    def pick_output(self):
-        p = filedialog.askdirectory(title="출력 폴더 선택")
+    def choose_output(self):
+        p = filedialog.askdirectory()
         if p:
             self.output_dir.set(p)
 
-    def start(self):
-        if self.running:
-            return
-        ref = Path(self.reference.get())
-        if not ref.exists():
-            messagebox.showerror("오류", "기준 사진을 선택해 주세요.")
-            return
-        if not self.files:
-            messagebox.showerror("오류", "보정할 사진을 추가해 주세요.")
-            return
-        out = Path(self.output_dir.get())
-        out.mkdir(parents=True, exist_ok=True)
+    def reset_adjustments(self):
+        self.match_strength.set(85)
+        for v in (self.brightness, self.contrast, self.saturation, self.temperature,
+                  self.tint, self.highlights, self.shadows, self.sharpness):
+            v.set(0)
+        self.schedule_preview()
 
-        self.running = True
-        self.run_btn.config(state="disabled")
-        self.progress["value"] = 0
-        self.progress["maximum"] = len(self.files)
-        threading.Thread(target=self._process, daemon=True).start()
-
-    def _process(self):
-        try:
-            ref_bgr, _, _, _ = read_image(self.reference.get())
-            ref_mean, ref_std = lab_stats(ref_bgr)
-            strength = max(0.0, min(1.0, self.strength.get() / 100.0))
-            output_root = Path(self.output_dir.get())
-
-            common_parent = None
+    def schedule_preview(self):
+        if self._preview_job:
             try:
-                common_parent = Path(os.path.commonpath([str(Path(p).parent) for p in self.files]))
+                self.after_cancel(self._preview_job)
             except Exception:
                 pass
+        self._preview_job = self.after(180, self.update_preview)
 
-            ok = 0
-            errors = []
+    def _selected_source(self):
+        sel = self.listbox.curselection()
+        if sel:
+            return self.files[sel[0]]
+        return self.files[0] if self.files else None
 
+    def _process_one(self, bgr, ref_mean, ref_std):
+        result = color_transfer(bgr, ref_mean, ref_std, self.match_strength.get() / 100.0)
+        return apply_manual_adjustments(
+            result,
+            self.brightness.get(), self.contrast.get(), self.saturation.get(),
+            self.temperature.get(), self.tint.get(), self.highlights.get(),
+            self.shadows.get(), self.sharpness.get()
+        )
+
+    def update_preview(self):
+        src = self._selected_source()
+        ref = self.ref_path.get()
+        if not src or not ref or not Path(src).exists() or not Path(ref).exists():
+            return
+        try:
+            src_bgr, *_ = read_image(src)
+            ref_bgr, *_ = read_image(ref)
+            ref_mean, ref_std = lab_stats(ref_bgr)
+
+            # Downscale before processing for responsive preview.
+            h, w = src_bgr.shape[:2]
+            max_side = 700
+            s = min(1.0, max_side / max(h, w))
+            if s < 1:
+                src_small = cv2.resize(src_bgr, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
+            else:
+                src_small = src_bgr
+            result = self._process_one(src_small, ref_mean, ref_std)
+
+            self._show_preview(self.before_label, src_small, "before")
+            self._show_preview(self.after_label, result, "after")
+        except Exception as e:
+            self.status.config(text=f"미리보기 오류: {e}")
+
+    def _show_preview(self, label, bgr, which):
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        im = Image.fromarray(rgb)
+        im.thumbnail((380, 360), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(im)
+        label.config(image=photo)
+        if which == "before":
+            self.preview_photo_before = photo
+        else:
+            self.preview_photo_after = photo
+
+    def start_processing(self):
+        if not self.ref_path.get() or not Path(self.ref_path.get()).exists():
+            messagebox.showwarning(APP_TITLE, "기준 사진을 선택해주세요.")
+            return
+        if not self.files:
+            messagebox.showwarning(APP_TITLE, "보정할 사진을 추가해주세요.")
+            return
+        if not self.output_dir.get():
+            messagebox.showwarning(APP_TITLE, "출력 폴더를 선택해주세요.")
+            return
+        threading.Thread(target=self.process_all, daemon=True).start()
+
+    def process_all(self):
+        try:
+            self.after(0, lambda: self.status.config(text="처리 중..."))
+            ref_bgr, *_ = read_image(self.ref_path.get())
+            ref_mean, ref_std = lab_stats(ref_bgr)
+            output_root = Path(self.output_dir.get())
+            output_root.mkdir(parents=True, exist_ok=True)
+
+            common_parent = None
+            if self.keep_subfolders.get() and self.files:
+                try:
+                    common_parent = Path(os.path.commonpath([str(Path(p).parent) for p in self.files]))
+                except Exception:
+                    pass
+
+            ok, errors = 0, []
+            total = len(self.files)
             for i, src in enumerate(self.files, 1):
                 try:
                     src_path = Path(src)
                     bgr, exif, icc, dpi = read_image(src_path)
-                    result = color_transfer(bgr, ref_mean, ref_std, strength)
+                    result = self._process_one(bgr, ref_mean, ref_std)
 
+                    rel_parent = Path()
                     if self.keep_subfolders.get() and common_parent:
                         try:
                             rel_parent = src_path.parent.relative_to(common_parent)
                         except Exception:
-                            rel_parent = Path()
-                    else:
-                        rel_parent = Path()
-
+                            pass
                     dest_dir = output_root / rel_parent
                     dest_dir.mkdir(parents=True, exist_ok=True)
-
                     dest = dest_dir / f"{src_path.stem}_matched{src_path.suffix}"
                     save_image(dest, result, exif=exif, icc=icc, dpi=dpi)
                     ok += 1
                 except Exception as e:
                     errors.append(f"{src}: {e}")
 
-                self.after(0, self._set_progress, i, src_path.name)
+                pct = i * 100 / total
+                self.after(0, lambda p=pct, i=i, n=src_path.name:
+                           (self.progress.config(value=p), self.status.config(text=f"{i}/{total}  {n}")))
 
-            msg = f"완료: {ok}개 사진 보정"
-            if errors:
-                msg += f"\n오류: {len(errors)}개"
-                log = output_root / "errors.txt"
-                log.write_text("\n".join(errors), encoding="utf-8")
-
-            self.after(0, self._finish, msg, bool(errors))
-        except Exception as e:
-            detail = traceback.format_exc()
-            self.after(0, self._fatal, str(e), detail)
-
-    def _set_progress(self, i, name):
-        self.progress["value"] = i
-        self.status.config(text=f"{i}/{len(self.files)} 처리 중: {name}")
-
-    def _finish(self, msg, had_errors):
-        self.running = False
-        self.run_btn.config(state="normal")
-        self.status.config(text="완료")
-        if had_errors:
-            messagebox.showwarning("완료", msg + "\n출력 폴더의 errors.txt를 확인해 주세요.")
-        else:
-            messagebox.showinfo("완료", msg)
-
-    def _fatal(self, msg, detail):
-        self.running = False
-        self.run_btn.config(state="normal")
-        self.status.config(text="오류 발생")
-        try:
-            Path(self.output_dir.get()).mkdir(parents=True, exist_ok=True)
-            (Path(self.output_dir.get()) / "fatal_error.txt").write_text(detail, encoding="utf-8")
+            def done():
+                if errors:
+                    messagebox.showwarning(APP_TITLE, f"완료: {ok}개\n오류: {len(errors)}개\n\n" + "\n".join(errors[:8]))
+                else:
+                    messagebox.showinfo(APP_TITLE, f"완료되었습니다.\n{ok}개 사진을 보정했습니다.")
+                self.status.config(text=f"완료 - {ok}/{total}")
+            self.after(0, done)
         except Exception:
-            pass
-        messagebox.showerror("오류", msg)
+            err = traceback.format_exc()
+            self.after(0, lambda: messagebox.showerror(APP_TITLE, err))
+
 
 if __name__ == "__main__":
-    App().mainloop()
+    app = PhotoColorMatcherApp()
+    app.mainloop()
