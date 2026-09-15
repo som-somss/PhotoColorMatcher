@@ -238,11 +238,11 @@ class PhotoColorMatcherApp(tk.Tk):
         self.clone_source_point = None
         self.clone_source_marker_id = None
 
-        # V7 semi-automatic object selection / editing state
+        # V8 manual polygon selection / editing state
         self.object_select_mode = False
-        self.object_select_start = None
-        self.object_select_rect_id = None
+        self.object_select_points = []
         self.object_edit_mask = None
+        self.edit_tool = "brush"
         self.object_hue = tk.DoubleVar(value=0)
         self.object_saturation = tk.DoubleVar(value=0)
         self.object_brightness = tk.DoubleVar(value=0)
@@ -351,7 +351,8 @@ class PhotoColorMatcherApp(tk.Tk):
         bar = ttk.Frame(wrap)
         bar.pack(fill="x")
         ttk.Button(bar, text="사진 열기", command=self.open_object_image).pack(side="left")
-        ttk.Button(bar, text="물체 자동 선택", command=self.activate_object_select).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="직접 영역 선택", command=self.activate_object_select).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="브러시", command=self.activate_brush_mode).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="선택 색상 변경", command=self.apply_object_color).pack(side="left", padx=6)
         ttk.Button(bar, text="선택 영역 삭제", command=self.run_object_removal).pack(side="left", padx=6)
         ttk.Button(bar, text="마스크 지우기", command=self.clear_object_mask).pack(side="left")
@@ -386,7 +387,7 @@ class PhotoColorMatcherApp(tk.Tk):
         ttk.Scale(color_opts, from_=-100, to=100, variable=self.object_saturation, length=130).pack(side="left", padx=5)
         ttk.Label(color_opts, text="밝기").pack(side="left", padx=(8, 0))
         ttk.Scale(color_opts, from_=-100, to=100, variable=self.object_brightness, length=130).pack(side="left", padx=5)
-        self.object_select_status = ttk.Label(color_opts, text="물체 자동 선택: 버튼 → 물체를 사각형으로 감싸세요.")
+        self.object_select_status = ttk.Label(color_opts, text="브러시 모드 · 직접 영역 선택 버튼을 누르면 클릭으로 외곽선을 딸 수 있습니다.")
         self.object_select_status.pack(side="left", padx=12)
 
         self.object_canvas = tk.Canvas(wrap, bg="#333333", highlightthickness=0, cursor="crosshair")
@@ -394,6 +395,7 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_canvas.bind("<Button-1>", self.object_canvas_click)
         self.object_canvas.bind("<B1-Motion>", self.object_canvas_drag)
         self.object_canvas.bind("<ButtonRelease-1>", self.object_canvas_release)
+        self.object_canvas.bind("<Double-Button-1>", lambda e: self.finish_manual_selection() if self.object_select_mode else None)
         self.bind_all("<Control-d>", self.activate_clone_source_mode)
         self.bind_all("<Control-D>", self.activate_clone_source_mode)
         self.object_canvas.bind("<Motion>", self.show_brush_preview)
@@ -443,11 +445,18 @@ class PhotoColorMatcherApp(tk.Tk):
             overlay = disp.copy()
             overlay[m] = [255, 55, 55]
             disp = np.where(m[..., None], (0.55*overlay + 0.45*disp).astype(np.uint8), disp)
-            # automatic object selection gets a crisp green outline
+            # selected area gets a crisp green outline
             if self.object_edit_mask is not None and np.any(self.object_edit_mask):
                 em = cv2.resize(self.object_edit_mask, (dw, dh), interpolation=cv2.INTER_NEAREST)
                 contours, _ = cv2.findContours((em > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(disp, contours, -1, (60, 255, 80), 2)
+
+        if self.object_select_mode and self.object_select_points:
+            pts_disp = [(int(px * scale), int(py * scale)) for px, py in self.object_select_points]
+            if len(pts_disp) >= 2:
+                cv2.polylines(disp, [np.array(pts_disp, dtype=np.int32)], False, (60, 255, 80), 2, cv2.LINE_AA)
+            for i, (px, py) in enumerate(pts_disp):
+                cv2.circle(disp, (px, py), 5 if i == 0 else 3, (60, 255, 80), -1, cv2.LINE_AA)
 
         im = Image.fromarray(disp)
         self.object_display_photo = ImageTk.PhotoImage(im)
@@ -481,16 +490,40 @@ class PhotoColorMatcherApp(tk.Tk):
         self.refresh_object_canvas()
 
     def activate_object_select(self):
-        """Start rectangle-assisted GrabCut selection."""
+        """Start manual polygon selection."""
         if self.object_result is None:
             messagebox.showwarning(APP_TITLE, "먼저 사진을 열어주세요.")
             return
         self.clone_source_mode = False
         self.object_select_mode = True
-        self.object_select_start = None
+        self.edit_tool = "polygon"
+        self.object_select_points = []
         self.object_edit_mask = None
         self.object_mask[:] = 0
-        self.object_select_status.config(text="자동 선택 중: 원하는 물체를 마우스로 드래그해 사각형으로 감싸세요.")
+        self.object_select_status.config(text="직접 선택 모드 · 외곽선을 따라 클릭하세요. 시작점을 다시 클릭하거나 더블클릭하면 완료됩니다.")
+        self.refresh_object_canvas()
+
+    def activate_brush_mode(self):
+        self.object_select_mode = False
+        self.edit_tool = "brush"
+        self.object_select_points = []
+        self.clone_source_mode = False
+        self.object_select_status.config(text="브러시 모드 · 마우스로 칠해서 선택 영역을 추가하세요.")
+        self.refresh_object_canvas()
+
+    def finish_manual_selection(self):
+        if self.object_result is None or len(self.object_select_points) < 3:
+            self.object_select_status.config(text="최소 3개 이상의 점을 찍어주세요.")
+            return
+        pts = np.array(self.object_select_points, dtype=np.int32)
+        mask = np.zeros(self.object_result.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(mask, [pts], 255)
+        self.object_mask = mask
+        self.object_edit_mask = mask.copy()
+        self.object_select_mode = False
+        self.edit_tool = "brush"
+        self.object_select_points = []
+        self.object_select_status.config(text="직접 선택 완료 · 색상 변경/삭제 가능 · 브러시로 선택 영역 추가 수정 가능")
         self.refresh_object_canvas()
 
     def _canvas_to_image(self, cx, cy):
@@ -499,80 +532,12 @@ class PhotoColorMatcherApp(tk.Tk):
         return int((cx - ox) / scale), int((cy - oy) / scale)
 
     def object_canvas_drag(self, event):
-        if self.object_select_mode and self.object_select_start is not None:
-            if self.object_select_rect_id is not None:
-                self.object_canvas.delete(self.object_select_rect_id)
-            x0, y0 = self.object_select_start
-            self.object_select_rect_id = self.object_canvas.create_rectangle(
-                x0, y0, event.x, event.y, outline="#00ff66", width=2, dash=(5, 3)
-            )
+        if self.object_select_mode:
             return
         self.paint_object_mask(event)
 
     def object_canvas_release(self, event):
-        if not self.object_select_mode or self.object_select_start is None:
-            return
-        x0c, y0c = self.object_select_start
-        x1c, y1c = event.x, event.y
-        self.object_select_mode = False
-        self.object_select_start = None
-        if self.object_select_rect_id is not None:
-            self.object_canvas.delete(self.object_select_rect_id)
-            self.object_select_rect_id = None
-
-        x0, y0 = self._canvas_to_image(min(x0c, x1c), min(y0c, y1c))
-        x1, y1 = self._canvas_to_image(max(x0c, x1c), max(y0c, y1c))
-        h, w = self.object_result.shape[:2]
-        x0, y0 = max(0, x0), max(0, y0)
-        x1, y1 = min(w - 1, x1), min(h - 1, y1)
-        rw, rh = x1 - x0, y1 - y0
-        if rw < 5 or rh < 5:
-            self.object_select_status.config(text="선택 범위가 너무 작습니다. 물체 전체를 조금 여유 있게 감싸주세요.")
-            self.refresh_object_canvas()
-            return
-
-        try:
-            # GrabCut separates foreground object from background inside user's rectangle.
-            gc_mask = np.zeros((h, w), np.uint8)
-            bgd = np.zeros((1, 65), np.float64)
-            fgd = np.zeros((1, 65), np.float64)
-            rect = (x0, y0, rw, rh)
-            cv2.grabCut(self.object_result, gc_mask, rect, bgd, fgd, 5, cv2.GC_INIT_WITH_RECT)
-            selected = np.where(
-                (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0
-            ).astype(np.uint8)
-
-            # Keep foreground components centered in / substantially overlapping the box.
-            n, labels, stats, cents = cv2.connectedComponentsWithStats(selected, 8)
-            if n > 1:
-                cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-                candidates = []
-                for i in range(1, n):
-                    area = stats[i, cv2.CC_STAT_AREA]
-                    if area < 20:
-                        continue
-                    px, py = cents[i]
-                    dist = ((px-cx)/max(rw,1))**2 + ((py-cy)/max(rh,1))**2
-                    score = area / (1.0 + 4.0*dist)
-                    candidates.append((score, i))
-                if candidates:
-                    # Keep best plus touching/nearby meaningful components
-                    best = max(candidates)[1]
-                    selected = np.where(labels == best, 255, 0).astype(np.uint8)
-                    kernel = np.ones((3,3), np.uint8)
-                    selected = cv2.morphologyEx(selected, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-            if not np.any(selected):
-                self.object_select_status.config(text="물체를 찾지 못했습니다. 물체 경계 바깥까지 조금 넓게 다시 감싸주세요.")
-                self.refresh_object_canvas()
-                return
-            self.object_edit_mask = selected.copy()
-            self.object_mask = selected.copy()
-            self.object_select_status.config(text="물체가 자동 선택되었습니다. 초록 경계를 확인 후 색상 변경 또는 삭제하세요.")
-            self.refresh_object_canvas()
-        except Exception as e:
-            self.object_select_status.config(text="자동 선택 실패")
-            messagebox.showerror(APP_TITLE, f"물체 자동 선택 중 오류가 발생했습니다.\n{e}")
+        return
 
     def apply_object_color(self):
         """Change hue/saturation/brightness only inside the selected object."""
@@ -600,8 +565,23 @@ class PhotoColorMatcherApp(tk.Tk):
         self.refresh_object_canvas()
 
     def object_canvas_click(self, event):
+        if self.object_result is None:
+            return
         if self.object_select_mode:
-            self.object_select_start = (event.x, event.y)
+            x, y = self._canvas_to_image(event.x, event.y)
+            h, w = self.object_result.shape[:2]
+            if not (0 <= x < w and 0 <= y < h):
+                return
+            if len(self.object_select_points) >= 3:
+                fx, fy = self.object_select_points[0]
+                scale = max(self.object_display_scale, 1e-6)
+                close_dist = max(6, int(12 / scale))
+                if (x-fx)**2 + (y-fy)**2 <= close_dist**2:
+                    self.finish_manual_selection()
+                    return
+            self.object_select_points.append((x, y))
+            self.object_select_status.config(text=f"직접 선택 중 · {len(self.object_select_points)}개 점 · 시작점을 다시 클릭하면 완료")
+            self.refresh_object_canvas()
             return
         if self.clone_source_mode:
             scale = self.object_display_scale
@@ -612,9 +592,7 @@ class PhotoColorMatcherApp(tk.Tk):
             if 0 <= x < w and 0 <= y < h:
                 self.clone_source_point = (x, y)
                 self.clone_source_mode = False
-                self.clone_status_label.config(
-                    text=f"질감 복제 모드 · 원본 위치 ({x}, {y}) 선택됨 · 선택 영역 삭제 시 이 주변 질감 사용"
-                )
+                self.clone_status_label.config(text=f"질감 복제 모드 · 원본 위치 ({x}, {y}) 선택됨 · 선택 영역 삭제 시 이 주변 질감 사용")
                 self.refresh_object_canvas()
             return
         self.paint_object_mask(event)
@@ -663,6 +641,9 @@ class PhotoColorMatcherApp(tk.Tk):
         if self.object_mask is not None:
             self.object_mask[:] = 0
             self.object_edit_mask = None
+            self.object_select_mode = False
+            self.object_select_points = []
+            self.edit_tool = "brush"
             if hasattr(self, "object_select_status"):
                 self.object_select_status.config(text="선택을 지웠습니다.")
             self.refresh_object_canvas()
