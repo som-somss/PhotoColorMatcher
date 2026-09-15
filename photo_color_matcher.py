@@ -119,6 +119,17 @@ def apply_manual_adjustments(bgr, brightness=0, contrast=0, saturation=0,
     return cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
 
 
+def remove_masked_object(bgr, mask, radius=5):
+    """Offline object removal using OpenCV inpainting."""
+    if mask is None or not np.any(mask):
+        return bgr.copy()
+    mask8 = np.where(mask > 0, 255, 0).astype(np.uint8)
+    # Slight dilation helps remove object edges as well.
+    kernel = np.ones((3, 3), np.uint8)
+    mask8 = cv2.dilate(mask8, kernel, iterations=1)
+    return cv2.inpaint(bgr, mask8, float(radius), cv2.INPAINT_TELEA)
+
+
 class PhotoColorMatcherApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -147,11 +158,29 @@ class PhotoColorMatcherApp(tk.Tk):
         self.preview_photo_after = None
         self._preview_job = None
 
+        # Offline object-removal state
+        self.object_image_path = None
+        self.object_bgr = None
+        self.object_result = None
+        self.object_mask = None
+        self.object_display_photo = None
+        self.object_display_scale = 1.0
+        self.object_display_offset = (0, 0)
+        self.object_history = []
+        self.brush_size = tk.DoubleVar(value=35)
+        self.inpaint_radius = tk.DoubleVar(value=5)
+
         self._build_ui()
 
     def _build_ui(self):
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True)
+        color_tab = ttk.Frame(notebook)
+        remove_tab = ttk.Frame(notebook)
+        notebook.add(color_tab, text="색감 보정")
+        notebook.add(remove_tab, text="물체 삭제")
         pad = 10
-        top = ttk.Frame(self, padding=pad)
+        top = ttk.Frame(color_tab, padding=pad)
         top.pack(fill="both", expand=True)
 
         ref = ttk.LabelFrame(top, text="기준 사진", padding=8)
@@ -220,6 +249,142 @@ class PhotoColorMatcherApp(tk.Tk):
         self.status = ttk.Label(bottom, text="준비됨")
         self.status.pack(anchor="w", pady=(4, 4))
         ttk.Button(bottom, text="자동 색감 보정 시작", command=self.start_processing).pack(fill="x", ipady=8)
+
+        self._build_remove_tab(remove_tab)
+
+    def _build_remove_tab(self, parent):
+        wrap = ttk.Frame(parent, padding=10)
+        wrap.pack(fill="both", expand=True)
+
+        bar = ttk.Frame(wrap)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="사진 열기", command=self.open_object_image).pack(side="left")
+        ttk.Button(bar, text="선택 영역 삭제", command=self.run_object_removal).pack(side="left", padx=6)
+        ttk.Button(bar, text="마스크 지우기", command=self.clear_object_mask).pack(side="left")
+        ttk.Button(bar, text="실행 취소", command=self.undo_object_removal).pack(side="left", padx=6)
+        ttk.Button(bar, text="원본 복원", command=self.restore_object_original).pack(side="left")
+        ttk.Button(bar, text="결과 저장", command=self.save_object_result).pack(side="right")
+
+        opts = ttk.Frame(wrap)
+        opts.pack(fill="x", pady=(8, 5))
+        ttk.Label(opts, text="브러시 크기").pack(side="left")
+        ttk.Scale(opts, from_=5, to=120, variable=self.brush_size, length=220).pack(side="left", padx=(6, 18))
+        ttk.Label(opts, text="복원 범위").pack(side="left")
+        ttk.Scale(opts, from_=1, to=15, variable=self.inpaint_radius, length=180).pack(side="left", padx=6)
+        ttk.Label(opts, text="삭제할 물체를 마우스로 칠한 뒤 '선택 영역 삭제'를 누르세요.").pack(side="left", padx=14)
+
+        self.object_canvas = tk.Canvas(wrap, bg="#333333", highlightthickness=0, cursor="crosshair")
+        self.object_canvas.pack(fill="both", expand=True)
+        self.object_canvas.bind("<Button-1>", self.paint_object_mask)
+        self.object_canvas.bind("<B1-Motion>", self.paint_object_mask)
+        self.object_canvas.bind("<Configure>", lambda e: self.refresh_object_canvas())
+
+    def open_object_image(self):
+        p = filedialog.askopenfilename(filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp")])
+        if not p:
+            return
+        try:
+            bgr, *_ = read_image(p)
+            self.object_image_path = p
+            self.object_bgr = bgr
+            self.object_result = bgr.copy()
+            self.object_mask = np.zeros(bgr.shape[:2], dtype=np.uint8)
+            self.object_history = []
+            self.refresh_object_canvas()
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"사진을 열 수 없습니다.\n{e}")
+
+    def refresh_object_canvas(self):
+        if self.object_result is None or not hasattr(self, "object_canvas"):
+            return
+        self.object_canvas.update_idletasks()
+        cw = max(100, self.object_canvas.winfo_width())
+        ch = max(100, self.object_canvas.winfo_height())
+        h, w = self.object_result.shape[:2]
+        scale = min(cw / w, ch / h, 1.0)
+        dw, dh = max(1, int(w * scale)), max(1, int(h * scale))
+        ox, oy = (cw - dw)//2, (ch - dh)//2
+        self.object_display_scale = scale
+        self.object_display_offset = (ox, oy)
+
+        rgb = cv2.cvtColor(self.object_result, cv2.COLOR_BGR2RGB)
+        disp = cv2.resize(rgb, (dw, dh), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+
+        if self.object_mask is not None and np.any(self.object_mask):
+            m = cv2.resize(self.object_mask, (dw, dh), interpolation=cv2.INTER_NEAREST) > 0
+            overlay = disp.copy()
+            overlay[m] = [255, 55, 55]
+            disp = np.where(m[..., None], (0.55*overlay + 0.45*disp).astype(np.uint8), disp)
+
+        im = Image.fromarray(disp)
+        self.object_display_photo = ImageTk.PhotoImage(im)
+        self.object_canvas.delete("all")
+        self.object_canvas.create_image(ox, oy, anchor="nw", image=self.object_display_photo)
+
+    def paint_object_mask(self, event):
+        if self.object_result is None or self.object_mask is None:
+            return
+        scale = self.object_display_scale
+        ox, oy = self.object_display_offset
+        x = int((event.x - ox) / scale)
+        y = int((event.y - oy) / scale)
+        h, w = self.object_mask.shape
+        if 0 <= x < w and 0 <= y < h:
+            radius = max(1, int(self.brush_size.get() / max(scale, 1e-6) / 2))
+            cv2.circle(self.object_mask, (x, y), radius, 255, -1)
+            self.refresh_object_canvas()
+
+    def clear_object_mask(self):
+        if self.object_mask is not None:
+            self.object_mask[:] = 0
+            self.refresh_object_canvas()
+
+    def run_object_removal(self):
+        if self.object_result is None:
+            messagebox.showwarning(APP_TITLE, "먼저 사진을 열어주세요.")
+            return
+        if self.object_mask is None or not np.any(self.object_mask):
+            messagebox.showwarning(APP_TITLE, "삭제할 물체를 먼저 마우스로 칠해주세요.")
+            return
+        self.object_history.append(self.object_result.copy())
+        self.object_result = remove_masked_object(
+            self.object_result, self.object_mask, int(round(self.inpaint_radius.get()))
+        )
+        self.object_mask[:] = 0
+        self.refresh_object_canvas()
+
+    def undo_object_removal(self):
+        if self.object_history:
+            self.object_result = self.object_history.pop()
+            if self.object_mask is not None:
+                self.object_mask[:] = 0
+            self.refresh_object_canvas()
+
+    def restore_object_original(self):
+        if self.object_bgr is not None:
+            self.object_result = self.object_bgr.copy()
+            self.object_history = []
+            if self.object_mask is not None:
+                self.object_mask[:] = 0
+            self.refresh_object_canvas()
+
+    def save_object_result(self):
+        if self.object_result is None:
+            messagebox.showwarning(APP_TITLE, "저장할 결과가 없습니다.")
+            return
+        stem = Path(self.object_image_path).stem if self.object_image_path else "edited"
+        ext = Path(self.object_image_path).suffix if self.object_image_path else ".jpg"
+        p = filedialog.asksaveasfilename(
+            initialfile=f"{stem}_object_removed{ext}",
+            defaultextension=ext,
+            filetypes=[("JPEG", "*.jpg *.jpeg"), ("PNG", "*.png"), ("All files", "*.*")]
+        )
+        if p:
+            try:
+                save_image(p, self.object_result)
+                messagebox.showinfo(APP_TITLE, "저장되었습니다.")
+            except Exception as e:
+                messagebox.showerror(APP_TITLE, f"저장 실패\n{e}")
 
     def add_slider(self, parent, label, var, lo, hi, suffix=""):
         row = ttk.Frame(parent)
