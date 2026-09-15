@@ -200,6 +200,8 @@ class PhotoColorMatcherApp(tk.Tk):
         self.shape_drag_start = None
         self.shape_preview_id = None
         super().__init__()
+        self.active_remove_tool = "brush"
+        self.clone_source_mode = False
         self.selection_tool = tk.StringVar(master=self, value="free")
         self.title(APP_TITLE)
         self.geometry("1080x760")
@@ -265,6 +267,9 @@ class PhotoColorMatcherApp(tk.Tk):
         self.bind_all("<Control-KP_Subtract>", lambda e: self.adjust_brush_size_shortcut(-1))
         self.bind_all("<Control-s>", self._ctrl_save)
         self.bind_all("<Control-S>", self._ctrl_save)
+
+        self.bind_all("<Control-d>", self.activate_clone_source_mode)
+        self.bind_all("<Control-D>", self.activate_clone_source_mode)
 
     def _build_ui(self):
         notebook = ttk.Notebook(self)
@@ -490,33 +495,17 @@ class PhotoColorMatcherApp(tk.Tk):
         return "break"
 
     def set_selection_tool(self, tool):
-        """Switch between rectangle, ellipse and free polygon selection."""
+        self.clone_source_mode = False
         self.selection_tool.set(tool)
         self.shape_drag_start = None
         if self.shape_preview_id:
-            try:
-                self.object_canvas.delete(self.shape_preview_id)
-            except Exception:
-                pass
+            try: self.object_canvas.delete(self.shape_preview_id)
+            except Exception: pass
             self.shape_preview_id = None
-
-        names = {"rect": "사각형 선택", "ellipse": "타원형 선택", "free": "직접 선택"}
-        try:
-            self.status_var.set(f"{names.get(tool, tool)} 도구가 선택되었습니다.")
-        except Exception:
-            pass
-
-        # Shape tools use drag. Free selection keeps the existing point-by-point behavior.
-        if tool in ("rect", "ellipse"):
-            self.object_canvas.bind("<ButtonPress-1>", self.shape_select_start)
-            self.object_canvas.bind("<B1-Motion>", self.shape_select_drag)
-            self.object_canvas.bind("<ButtonRelease-1>", self.shape_select_end)
-        else:
-            # Restore the app's existing manual polygon selection bindings.
-            try:
-                self.start_manual_selection()
-            except Exception:
-                pass
+        self._set_remove_tool_bindings(tool)
+        names={"rect":"사각형 선택","ellipse":"타원형 선택","free":"직접 선택"}
+        try: self.status_var.set(f"{names.get(tool, tool)} 도구가 선택되었습니다.")
+        except Exception: pass
 
     def _canvas_to_image_xy(self, x, y):
         """Convert canvas coordinates to original-image coordinates, respecting V8.1 zoom."""
@@ -589,15 +578,9 @@ class PhotoColorMatcherApp(tk.Tk):
         else:
             cv2.rectangle(mask, (left, top), (right, bottom), 255, -1)
 
-        # Store under the mask attribute used by this app.
-        stored = False
-        for name in ("selection_mask", "object_mask", "mask"):
-            if hasattr(self, name):
-                setattr(self, name, mask)
-                stored = True
-                break
-        if not stored:
-            self.selection_mask = mask
+        # One canonical selection mask for every editing action.
+        self.object_mask = mask
+        self.selection_mask = mask.copy()
 
         # Refresh overlay using whichever renderer exists.
         for name in ("refresh_object_canvas", "update_object_canvas", "render_object_canvas", "show_object_image"):
@@ -709,12 +692,10 @@ class PhotoColorMatcherApp(tk.Tk):
             self.object_canvas.create_line(cx, cy-r-5, cx, cy+r+5, fill="#00e5ff", width=2)
 
     def activate_clone_source_mode(self, event=None):
-        """Ctrl+D 후 다음 클릭 위치를 질감/색상 원본으로 지정."""
-        if self.object_result is None:
-            messagebox.showwarning(APP_TITLE, "먼저 사진을 열어주세요.")
-            return "break"
         self.clone_source_mode = True
-        self.clone_status_label.config(text="질감 원본 선택 중: 사진에서 가져올 부분을 한 번 클릭하세요.")
+        self._set_remove_tool_bindings("clone_source")
+        try: self.status_var.set("질감 원본 선택: 복제할 색감/질감의 원본 위치를 클릭하세요.")
+        except Exception: pass
         return "break"
 
     def clear_clone_source(self):
@@ -725,26 +706,19 @@ class PhotoColorMatcherApp(tk.Tk):
         self.refresh_object_canvas()
 
     def activate_object_select(self):
-        """Start manual polygon selection."""
-        if self.object_result is None:
-            messagebox.showwarning(APP_TITLE, "먼저 사진을 열어주세요.")
-            return
         self.clone_source_mode = False
-        self.object_select_mode = True
-        self.edit_tool = "polygon"
-        self.object_select_points = []
-        self.object_edit_mask = None
-        self.object_mask[:] = 0
-        self.object_select_status.config(text="직접 선택 모드 · 외곽선을 따라 클릭하세요. 시작점을 다시 클릭하거나 더블클릭하면 완료됩니다.")
-        self.refresh_object_canvas()
+        self.selection_tool.set("free")
+        self._set_remove_tool_bindings("free")
+        for n in ("manual_points", "polygon_points"):
+            if hasattr(self, n): setattr(self, n, [])
+        try: self.status_var.set("직접 선택: 외곽선을 따라 클릭하고 마지막 점에서 더블클릭하세요.")
+        except Exception: pass
 
     def activate_brush_mode(self):
-        self.object_select_mode = False
-        self.edit_tool = "brush"
-        self.object_select_points = []
         self.clone_source_mode = False
-        self.object_select_status.config(text="브러시 모드 · 마우스로 칠해서 선택 영역을 추가하세요.")
-        self.refresh_object_canvas()
+        self._set_remove_tool_bindings("brush")
+        try: self.status_var.set("브러시 모드: 드래그하여 마스크를 칠하세요.")
+        except Exception: pass
 
     def finish_manual_selection(self):
         if self.object_result is None or len(self.object_select_points) < 3:
@@ -759,6 +733,8 @@ class PhotoColorMatcherApp(tk.Tk):
         self.edit_tool = "brush"
         self.object_select_points = []
         self.object_select_status.config(text="직접 선택 완료 · 색상 변경/삭제 가능 · 브러시로 선택 영역 추가 수정 가능")
+        if hasattr(self, "selection_mask") and isinstance(self.selection_mask, np.ndarray):
+            self.object_mask = self.selection_mask.copy()
         self.refresh_object_canvas()
 
     def _canvas_to_image(self, cx, cy):
@@ -776,13 +752,12 @@ class PhotoColorMatcherApp(tk.Tk):
 
     def apply_object_color(self):
         """Open a Photoshop-like system color picker and recolor the selected object."""
-        # Find the active selection mask.
-        mask = None
-        for name in ("selection_mask", "object_mask", "mask"):
-            candidate = getattr(self, name, None)
-            if isinstance(candidate, np.ndarray) and candidate.size and np.any(candidate > 0):
-                mask = candidate
-                break
+        # Use the same mask created by every selection tool.
+        mask = getattr(self, "object_mask", None)
+        if not (isinstance(mask, np.ndarray) and mask.size and np.any(mask > 0)):
+            mask = getattr(self, "selection_mask", None)
+        if not (isinstance(mask, np.ndarray) and mask.size and np.any(mask > 0)):
+            mask = None
 
         if mask is None:
             messagebox.showinfo("선택 필요", "먼저 색상을 변경할 영역을 선택해주세요.")
@@ -856,8 +831,19 @@ class PhotoColorMatcherApp(tk.Tk):
         except Exception:
             pass
 
-
     def object_canvas_click(self, event):
+        if getattr(self, "clone_source_mode", False) or getattr(self, "active_remove_tool", "") == "clone_source":
+            ix, iy = self._canvas_to_image(event.x, event.y)
+            self.clone_source = (int(ix), int(iy))
+            self.clone_source_point = self.clone_source
+            self.clone_source_mode = False
+            self._set_remove_tool_bindings("brush")
+            try: self.status_var.set(f"질감 원본 선택 완료: ({int(ix)}, {int(iy)})")
+            except Exception: pass
+            try: self.refresh_object_canvas()
+            except Exception: pass
+            return "break"
+
         if self.object_result is None:
             return
         if self.object_select_mode:
