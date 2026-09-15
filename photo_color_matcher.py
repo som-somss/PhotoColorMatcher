@@ -197,10 +197,10 @@ class PhotoColorMatcherApp(tk.Tk):
     def __init__(self):
 
         # V8.3 selection tool state
-        self.selection_tool = tk.StringVar(value="free")
         self.shape_drag_start = None
         self.shape_preview_id = None
         super().__init__()
+        self.selection_tool = tk.StringVar(master=self, value="free")
         self.title(APP_TITLE)
         self.geometry("1080x760")
         self.minsize(900, 680)
