@@ -19,12 +19,16 @@ def make_toolbar_icon(kind, size=28, fg="#f7f9fb"):
     The icon is drawn at high resolution and reduced with LANCZOS, so the EXE
     stays self-contained while curves/diagonals remain smooth on Windows.
     """
+    # Icons are authored in a canonical 30x30 coordinate system.
+    # Always render that full coordinate space first, then downsample to the
+    # requested toolbar size.  Rendering directly into a 22x22 canvas clipped
+    # artwork whose coordinates extend to x/y=30.
     S = 8
-    N = size * S
+    N = 30 * S
     im = Image.new("RGBA", (N, N), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
     c = fg
-    w = max(5, round(size * 0.065 * S))
+    w = max(5, round(30 * 0.065 * S))
 
     def P(v): return round(v * S)
     def box(x0, y0, x1, y1): return tuple(P(v) for v in (x0, y0, x1, y1))
@@ -1643,25 +1647,92 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_select_status.config(text="볼록하게 · P · 클릭하거나 드래그하면 브러시 중심에서 바깥쪽으로 부풀어 오릅니다.")
         return "break"
 
-    def _apply_bloat(self,event):
-        img,valid,layer=self._active_layer_edit_target()
-        if img is None:return
-        x,y=self._canvas_to_image(event.x,event.y); h,w=img.shape[:2]
-        if not(0<=x<w and 0<=y<h):return
-        r=max(3,int(self.brush_size.get()/max(self.object_display_scale,1e-6)/2)); st=max(.01,min(1.,float(self.liquify_strength.get())/100.))
-        yy,xx=np.ogrid[:h,:w]; rx=xx-x; ry=yy-y; d=np.sqrt(rx*rx+ry*ry); inside=d<r
-        fall=np.zeros((h,w),np.float32); fall[inside]=(1-d[inside]/r)**2
-        # inverse mapping toward center makes destination appear expanded
-        factor=st*.45*fall
-        mx=np.tile(np.arange(w,dtype=np.float32),(h,1))-rx*factor
-        my=np.tile(np.arange(h,dtype=np.float32)[:,None],(1,w))-ry*factor
-        warped=cv2.remap(img,mx,my,cv2.INTER_CUBIC,borderMode=cv2.BORDER_REFLECT)
+    def _apply_bloat(self, event):
+        """Radially expand pixels under the brush, limited to the active layer.
+
+        For an object layer both RGB pixels and its alpha/mask are warped, so
+        the object itself can grow while the background remains untouched.
+        """
+        img, valid, layer = self._active_layer_edit_target()
+        if img is None:
+            return
+
+        x, y = self._canvas_to_image(event.x, event.y)
+        h, w = img.shape[:2]
+        if not (0 <= x < w and 0 <= y < h):
+            return
+
+        # Ignore clicks completely outside the selected object layer.  A small
+        # margin is allowed so the edge of an object can still be expanded.
         if valid is not None:
-            wm=cv2.remap(valid,mx,my,cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT)
-            warped[wm==0]=0; valid=wm
-        fm=self._ensure_freeze_mask()
-        if fm is not None and np.any(fm): warped[fm>0]=img[fm>0]
-        self._commit_active_layer_edit(warped,valid,layer); self.refresh_object_canvas(); self.show_brush_preview(event)
+            rr = max(3, int(self.brush_size.get() / max(self.object_display_scale, 1e-6) / 2))
+            y0, y1 = max(0, y-rr), min(h, y+rr+1)
+            x0, x1 = max(0, x-rr), min(w, x+rr+1)
+            if not np.any(valid[y0:y1, x0:x1] > 0):
+                self.show_brush_preview(event)
+                return
+
+        r = max(4, int(self.brush_size.get() / max(self.object_display_scale, 1e-6) / 2))
+        strength = max(0.01, min(1.0, float(self.liquify_strength.get()) / 100.0))
+
+        # Work only in a local ROI. This is faster and, more importantly, keeps
+        # the active object independent from the composited background.
+        pad = max(3, int(r * 0.35))
+        x0, x1 = max(0, x-r-pad), min(w, x+r+pad+1)
+        y0, y1 = max(0, y-r-pad), min(h, y+r+pad+1)
+        src = img[y0:y1, x0:x1].copy()
+        src_mask = None if valid is None else valid[y0:y1, x0:x1].copy()
+
+        lh, lw = src.shape[:2]
+        cx, cy = float(x-x0), float(y-y0)
+        yy, xx = np.mgrid[0:lh, 0:lw].astype(np.float32)
+        dx, dy = xx-cx, yy-cy
+        dist = np.sqrt(dx*dx + dy*dy)
+        inside = dist < float(r)
+
+        # Inverse map destinations toward the centre.  A stronger smooth falloff
+        # makes a single click visibly bloat while repeated/dragged input builds
+        # the effect progressively.
+        fall = np.zeros_like(dist, dtype=np.float32)
+        fall[inside] = (1.0 - dist[inside] / float(r)) ** 1.55
+        amount = (0.18 + 0.62 * strength) * fall
+        map_x = xx - dx * amount
+        map_y = yy - dy * amount
+
+        warped = cv2.remap(src, map_x, map_y, cv2.INTER_CUBIC,
+                           borderMode=cv2.BORDER_REFLECT_101)
+
+        if src_mask is not None:
+            # Warp the object's mask with the same field. This is what lets the
+            # object silhouette actually expand instead of only distorting pixels
+            # inside its old boundary.
+            warped_mask = cv2.remap(src_mask, map_x, map_y, cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            warped_mask = np.where(warped_mask > 24, 255, 0).astype(np.uint8)
+            warped[warped_mask == 0] = 0
+        else:
+            warped_mask = None
+
+        # Freeze/protect mask is stored in full-canvas coordinates. Blend the
+        # original pixels back in where protected.
+        fm = self._ensure_freeze_mask()
+        if fm is not None and np.any(fm):
+            local_fm = fm[y0:y1, x0:x1] > 0
+            warped[local_fm] = src[local_fm]
+            if warped_mask is not None:
+                warped_mask[local_fm] = src_mask[local_fm]
+
+        out = img.copy()
+        out[y0:y1, x0:x1] = warped
+        if valid is not None:
+            out_mask = valid.copy()
+            out_mask[y0:y1, x0:x1] = warped_mask
+        else:
+            out_mask = None
+
+        self._commit_active_layer_edit(out, out_mask, layer)
+        self.refresh_object_canvas()
+        self.show_brush_preview(event)
 
     def activate_liquify_mode(self):
         """Photoshop-like liquify push tool. Drag inside the brush to push pixels."""
