@@ -1017,8 +1017,17 @@ class PhotoColorMatcherApp(tk.Tk):
         # becomes an independent movable layer, remove that guide so it does
         # not remain on the canvas. The layer itself and every existing
         # editing feature remain unchanged.
-        if isinstance(getattr(self, "object_edit_mask", None), np.ndarray):
-            self.object_edit_mask[:] = 0
+        # Once the selected area becomes an independent movable layer, the
+        # selection/brush marking is only a guide and must disappear. Clear all
+        # selection-mask representations, but do NOT touch the new layer mask.
+        # This keeps the cropped object intact while removing the red/green
+        # marking from the canvas during move operations.
+        for _mask_name in ("object_mask", "selection_mask", "object_edit_mask"):
+            _mask = getattr(self, _mask_name, None)
+            if isinstance(_mask, np.ndarray):
+                _mask[:] = 0
+        self._last_brush_point = None
+        self.hide_brush_preview()
         self.move_drag_start = None
         self.move_offset = (0,0)
         self._set_remove_tool_bindings("move")
