@@ -91,9 +91,34 @@ def make_toolbar_icon(kind, size=34, fg="#f7f9fb"):
         d.ellipse(box(4,5,25,24), outline=c, width=w)
         d.ellipse(box(17.5,17,24.5,24), fill=(0,0,0,0))
         for x,y in [(10,10),(16.5,9),(20.5,13.5),(11.5,18)]: d.ellipse(box(x-1.6,y-1.6,x+1.6,y+1.6),fill=c)
+    elif kind == "blur":
+        # Photoshop-style blur tool: clean water droplet silhouette
+        # pointed top with a rounded lower body
+        poly([(15,3.2),(9.0,12.0),(6.7,16.2),(6.6,18.7),(7.2,21.4),
+              (8.7,23.8),(10.8,25.5),(13.5,26.5),(16.4,26.4),(19.1,25.3),
+              (21.3,23.2),(22.7,20.5),(23.1,17.8),(22.5,15.1),(20.8,12.1)])
+        # subtle highlight cut-out for a more polished icon
+        d.arc(box(9.0,14.0,16.2,22.5), start=P(105), end=P(205), fill="#343b42", width=max(3,w-2))
     elif kind == "clone":
         ellipse(11,4,19,12,fill=c); rect(8,11,22,17,fill=c,r=1)
         rect(5,17,25,25,width=w,r=2)
+    elif kind == "move":
+        # Four-direction move tool, similar to a professional image editor.
+        lw = max(4, w-1)
+        line([(15,4),(15,26)], width=lw); line([(4,15),(26,15)], width=lw)
+        poly([(15,2.5),(10.5,8),(19.5,8)])
+        poly([(15,27.5),(10.5,22),(19.5,22)])
+        poly([(2.5,15),(8,10.5),(8,19.5)])
+        poly([(27.5,15),(22,10.5),(22,19.5)])
+    elif kind == "crop":
+        # Photoshop-style crop corners
+        lw = max(4, w-1)
+        line([(8,3.5),(8,20.5),(25,20.5)], width=lw)
+        line([(3.5,8),(20.5,8),(20.5,25)], width=lw)
+        line([(12,3.5),(12,8)], width=max(3,w-2))
+        line([(3.5,12),(8,12)], width=max(3,w-2))
+        line([(20.5,16),(25,16)], width=max(3,w-2))
+        line([(16,20.5),(16,25)], width=max(3,w-2))
     elif kind == "compare":
         # split-frame before/after comparison icon
         rect(4.5,5,25.5,24.5,width=w,r=1.6)
@@ -358,10 +383,20 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_zoom_center = None
         self.object_history = []
         self.object_compare_original = False
+        self.object_full_original = None
+        self.crop_drag_start = None
+        self.crop_preview_id = None
+        # V15 selected-pixel move state
+        self.move_drag_start = None
+        self.move_base_result = None
+        self.move_layer = None
+        self.move_mask = None
+        self.move_offset = (0, 0)
         self._last_brush_point = None
         self.brush_size = tk.DoubleVar(value=35)
         self.inpaint_radius = tk.DoubleVar(value=5)
         self.remove_strength = tk.DoubleVar(value=70)
+        self.blur_strength = tk.DoubleVar(value=35)
         self.brush_preview_id = None
         self.clone_source_mode = False
         self.clone_source_point = None
@@ -506,6 +541,8 @@ class PhotoColorMatcherApp(tk.Tk):
             return b
 
         add_icon("open", "사진 열기", self.open_object_image)
+        add_icon("crop", "사진 잘라내기", self.activate_crop_mode, "crop")
+        add_icon("move", "선택 영역 잘라서 이동", self.activate_move_mode, "move")
         tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
         add_icon("rect", "사각형 선택", lambda: self.set_selection_tool("rect"), "rect")
         add_icon("ellipse", "타원형 선택", lambda: self.set_selection_tool("ellipse"), "ellipse")
@@ -515,6 +552,7 @@ class PhotoColorMatcherApp(tk.Tk):
         add_icon("subtract_lasso", "직접 선택하여 선택영역 해제", self.activate_selection_subtract_mode, "free_subtract")
         tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
         add_icon("color", "선택 색상 변경", self.apply_object_color)
+        add_icon("blur", "선택 영역 블러", self.apply_selection_blur)
         add_icon("remove", "선택 영역 삭제", self.run_object_removal)
         add_icon("eyedrop", "질감 원본 선택 · Ctrl+D", self.activate_clone_source_mode, "clone_source")
         add_icon("clear", "질감 선택 해제", self.clear_clone_source)
@@ -537,6 +575,11 @@ class PhotoColorMatcherApp(tk.Tk):
         self.remove_strength_label = ttk.Label(opts, text="70", width=4)
         self.remove_strength_label.pack(side="left")
         self.remove_strength.trace_add("write", lambda *_: self.remove_strength_label.config(text=str(int(self.remove_strength.get()))))
+        ttk.Label(opts, text="블러 강도").pack(side="left", padx=(12, 0))
+        ttk.Scale(opts, from_=1, to=100, variable=self.blur_strength, length=120).pack(side="left", padx=6)
+        self.blur_strength_label = ttk.Label(opts, text="35", width=4)
+        self.blur_strength_label.pack(side="left")
+        self.blur_strength.trace_add("write", lambda *_: self.blur_strength_label.config(text=str(int(self.blur_strength.get()))))
         self.clone_status_label = ttk.Label(
             opts,
             text="자동 복원 모드 · Ctrl+D → 사진의 질감 원본 클릭 시 복제 모드",
@@ -572,7 +615,8 @@ class PhotoColorMatcherApp(tk.Tk):
         try:
             bgr, *_ = read_image(p)
             self.object_image_path = p
-            self.object_bgr = bgr
+            self.object_bgr = bgr.copy()
+            self.object_full_original = bgr.copy()
             self.object_result = bgr.copy()
             self.object_compare_original = False
             self.object_mask = np.zeros(bgr.shape[:2], dtype=np.uint8)
@@ -661,8 +705,155 @@ class PhotoColorMatcherApp(tk.Tk):
             self.object_select_points = []
         self.hide_brush_preview()
         if hasattr(self, "object_canvas"):
-            self.object_canvas.configure(cursor="pencil" if tool in ("brush", "eraser") else "crosshair")
+            cursor = "fleur" if tool == "move" else ("pencil" if tool in ("brush", "eraser") else ("tcross" if tool == "crop" else "crosshair"))
+            self.object_canvas.configure(cursor=cursor)
         return "break"
+
+
+    def activate_move_mode(self):
+        """Cut the current selection into a movable layer and drag it to a new position."""
+        if self.object_result is None:
+            messagebox.showwarning(APP_TITLE, "먼저 사진을 열어주세요.")
+            return "break"
+        mask = self.object_mask
+        if mask is None or not np.any(mask):
+            messagebox.showwarning(APP_TITLE, "먼저 사각형/타원형/직접 선택 또는 브러시로 이동할 영역을 선택해주세요.")
+            return "break"
+        self.clone_source_mode = False
+        self._set_remove_tool_bindings("move")
+        self.move_drag_start = None
+        self.move_offset = (0, 0)
+        self.move_mask = (mask > 0).astype(np.uint8) * 255
+        self.move_layer = self.object_result.copy()
+        # Fill the cut-out source naturally, so moving an object does not leave a duplicate behind.
+        radius = max(3, int(round(float(self.inpaint_radius.get()))))
+        self.move_base_result = cv2.inpaint(self.object_result[:, :, :3], self.move_mask, radius, cv2.INPAINT_TELEA)
+        if self.object_result.ndim == 3 and self.object_result.shape[2] > 3:
+            self.move_base_result = np.dstack([self.move_base_result, self.object_result[:, :, 3:]])
+        self.refresh_object_canvas()
+        self.object_select_status.config(text="이동 도구 · 선택한 영역을 드래그해서 원하는 위치로 옮기세요.")
+        return "break"
+
+    def move_selection_start(self, event):
+        if self.move_mask is None or not np.any(self.move_mask):
+            return
+        x, y = self._canvas_to_image(event.x, event.y)
+        h, w = self.move_mask.shape[:2]
+        if 0 <= x < w and 0 <= y < h and self.move_mask[y, x] > 0:
+            self.move_drag_start = (x, y)
+            self.move_offset = (0, 0)
+
+    def _compose_moved_selection(self, dx, dy):
+        base = self.move_base_result.copy()
+        h, w = self.move_mask.shape[:2]
+        ys, xs = np.where(self.move_mask > 0)
+        if len(xs) == 0: return base
+        nx, ny = xs + dx, ys + dy
+        valid = (nx >= 0) & (nx < w) & (ny >= 0) & (ny < h)
+        base[ny[valid], nx[valid], :3] = self.move_layer[ys[valid], xs[valid], :3]
+        if base.ndim == 3 and base.shape[2] > 3 and self.move_layer.shape[2] > 3:
+            base[ny[valid], nx[valid], 3:] = self.move_layer[ys[valid], xs[valid], 3:]
+        return base
+
+    def move_selection_drag(self, event):
+        if self.move_drag_start is None: return
+        x, y = self._canvas_to_image(event.x, event.y)
+        dx, dy = x - self.move_drag_start[0], y - self.move_drag_start[1]
+        self.move_offset = (dx, dy)
+        self.object_result = self._compose_moved_selection(dx, dy)
+        self.refresh_object_canvas()
+
+    def move_selection_end(self, event):
+        if self.move_drag_start is None: return
+        dx, dy = self.move_offset
+        # Store pre-move image for one-step Undo.
+        self.object_history.append(self.move_layer.copy())
+        self.object_result = self._compose_moved_selection(dx, dy)
+        # Move the selection mask with the pixels so further edits target the new location.
+        h, w = self.move_mask.shape[:2]
+        shifted = np.zeros_like(self.move_mask)
+        ys, xs = np.where(self.move_mask > 0); nx, ny = xs + dx, ys + dy
+        valid = (nx >= 0) & (nx < w) & (ny >= 0) & (ny < h)
+        shifted[ny[valid], nx[valid]] = 255
+        self.object_mask = shifted
+        self.selection_mask = shifted.copy()
+        self.move_mask = shifted.copy()
+        self.move_layer = self.object_result.copy()
+        self.move_base_result = self.object_result.copy()
+        self.move_drag_start = None
+        self.move_offset = (0, 0)
+        self.refresh_object_canvas()
+        self.object_select_status.config(text="이동 완료 · 다시 선택한 영역을 드래그하거나 실행 취소할 수 있습니다.")
+
+    def activate_crop_mode(self):
+        """Activate rectangular crop. Drag over the area to keep; release to crop."""
+        self.clone_source_mode = False
+        self.crop_drag_start = None
+        if self.crop_preview_id:
+            try: self.object_canvas.delete(self.crop_preview_id)
+            except Exception: pass
+            self.crop_preview_id = None
+        self._set_remove_tool_bindings("crop")
+        if hasattr(self, "object_select_status"):
+            self.object_select_status.config(text="잘라내기 · 남길 영역을 드래그하세요. 마우스를 놓으면 적용됩니다.")
+        try: self.status_var.set("잘라내기: 사진에서 남길 영역을 드래그하세요.")
+        except Exception: pass
+        return "break"
+
+    def crop_select_start(self, event):
+        self.crop_drag_start = (event.x, event.y)
+        if self.crop_preview_id:
+            try: self.object_canvas.delete(self.crop_preview_id)
+            except Exception: pass
+            self.crop_preview_id = None
+
+    def crop_select_drag(self, event):
+        if not self.crop_drag_start:
+            return
+        x0, y0 = self.crop_drag_start
+        if self.crop_preview_id:
+            try: self.object_canvas.delete(self.crop_preview_id)
+            except Exception: pass
+        self.crop_preview_id = self.object_canvas.create_rectangle(
+            x0, y0, event.x, event.y, outline="#f7f9fb", width=2, dash=(7,4))
+
+    def crop_select_end(self, event):
+        if not self.crop_drag_start or self.object_result is None:
+            return
+        x0, y0 = self.crop_drag_start
+        self.crop_drag_start = None
+        x1, y1 = event.x, event.y
+        ix0, iy0 = self._canvas_to_image_xy(x0, y0)
+        ix1, iy1 = self._canvas_to_image_xy(x1, y1)
+        left, right = sorted((ix0, ix1)); top, bottom = sorted((iy0, iy1))
+        h, wimg = self.object_result.shape[:2]
+        left=max(0,min(wimg-1,left)); right=max(0,min(wimg,right))
+        top=max(0,min(h-1,top)); bottom=max(0,min(h,bottom))
+        if right-left < 4 or bottom-top < 4:
+            if hasattr(self, "object_select_status"):
+                self.object_select_status.config(text="잘라낼 영역이 너무 작습니다. 다시 드래그하세요.")
+            return
+        # Save both edited image and current comparison original so Undo can fully restore crop.
+        self.object_history.append(("crop", self.object_result.copy(), self.object_bgr.copy() if self.object_bgr is not None else None))
+        self.object_result = self.object_result[top:bottom, left:right].copy()
+        if self.object_bgr is not None:
+            self.object_bgr = self.object_bgr[top:bottom, left:right].copy()
+        nh, nw = self.object_result.shape[:2]
+        self.object_mask = np.zeros((nh,nw), dtype=np.uint8)
+        self.selection_mask = self.object_mask.copy()
+        self.object_edit_mask = None
+        self.object_zoom = 1.0
+        self.object_zoom_center = None
+        self.object_compare_original = False
+        if self.crop_preview_id:
+            try: self.object_canvas.delete(self.crop_preview_id)
+            except Exception: pass
+            self.crop_preview_id = None
+        self.refresh_object_canvas()
+        if hasattr(self, "object_select_status"):
+            self.object_select_status.config(text=f"잘라내기 완료 · {nw} × {nh}px · 실행 취소로 되돌릴 수 있습니다.")
+        try: self.status_var.set(f"사진을 {nw} × {nh}px로 잘라냈습니다.")
+        except Exception: pass
 
     def set_selection_tool(self, tool):
         self.clone_source_mode = False
@@ -939,6 +1130,44 @@ class PhotoColorMatcherApp(tk.Tk):
     def object_canvas_release(self, event):
         return
 
+    def apply_selection_blur(self):
+        """Blur only the currently selected mask while preserving a natural edge."""
+        mask = getattr(self, "object_mask", None)
+        if not (isinstance(mask, np.ndarray) and mask.size and np.any(mask > 0)):
+            mask = getattr(self, "selection_mask", None)
+        if not (isinstance(mask, np.ndarray) and mask.size and np.any(mask > 0)):
+            messagebox.showinfo("선택 필요", "먼저 블러 처리할 영역을 선택해주세요.")
+            return
+        if self.object_result is None:
+            messagebox.showwarning(APP_TITLE, "먼저 사진을 열어주세요.")
+            return
+
+        strength = max(1, min(100, int(round(self.blur_strength.get()))))
+        # Map 1..100 to a useful Gaussian sigma. Large values create strong privacy blur.
+        sigma = 0.6 + (strength / 100.0) * 24.0
+        src = self.object_result.copy()
+        blurred = cv2.GaussianBlur(src, (0, 0), sigmaX=sigma, sigmaY=sigma, borderType=cv2.BORDER_REFLECT)
+
+        # Slight feathering only at the boundary prevents a hard pasted-on edge.
+        feather_sigma = max(0.6, min(2.2, sigma * 0.08))
+        alpha = cv2.GaussianBlur(mask, (0, 0), feather_sigma).astype(np.float32) / 255.0
+        if src.ndim == 3:
+            alpha = alpha[..., None]
+        result = (src.astype(np.float32) * (1.0 - alpha) +
+                  blurred.astype(np.float32) * alpha).clip(0, 255).astype(np.uint8)
+
+        self.object_history.append(self.object_result.copy())
+        self.object_result = result
+        self.object_compare_original = False
+        self._sync_tool_buttons()
+        self.refresh_object_canvas()
+        try:
+            self.status_var.set(f"선택 영역에 블러를 적용했습니다. 강도 {strength}")
+        except Exception:
+            pass
+        if hasattr(self, "object_select_status"):
+            self.object_select_status.config(text=f"블러 적용 완료 · 강도 {strength} · 실행 취소로 되돌릴 수 있습니다.")
+
     def apply_object_color(self):
         """Open a Photoshop-like system color picker and recolor the selected object."""
         # Use the same mask created by every selection tool.
@@ -1034,6 +1263,14 @@ class PhotoColorMatcherApp(tk.Tk):
                 self.refresh_object_canvas()
             return "break"
 
+        if tool == "move":
+            self.move_selection_start(event)
+            return "break"
+
+        if tool == "crop":
+            self.crop_select_start(event)
+            return "break"
+
         if tool in ("rect", "ellipse"):
             self.shape_select_start(event)
             return "break"
@@ -1071,7 +1308,11 @@ class PhotoColorMatcherApp(tk.Tk):
 
     def object_canvas_drag(self, event):
         tool = self.active_remove_tool
-        if tool in ("rect", "ellipse"):
+        if tool == "move":
+            self.move_selection_drag(event)
+        elif tool == "crop":
+            self.crop_select_drag(event)
+        elif tool in ("rect", "ellipse"):
             self.shape_select_drag(event)
         elif tool == "brush":
             self.paint_object_mask(event)
@@ -1080,7 +1321,11 @@ class PhotoColorMatcherApp(tk.Tk):
         return "break"
 
     def object_canvas_release(self, event):
-        if self.active_remove_tool in ("rect", "ellipse"):
+        if self.active_remove_tool == "move":
+            self.move_selection_end(event)
+        elif self.active_remove_tool == "crop":
+            self.crop_select_end(event)
+        elif self.active_remove_tool in ("rect", "ellipse"):
             self.shape_select_end(event)
         self._last_brush_point = None
         return "break"
@@ -1215,14 +1460,25 @@ class PhotoColorMatcherApp(tk.Tk):
 
     def undo_object_removal(self):
         if self.object_history:
-            self.object_result = self.object_history.pop()
-            if self.object_mask is not None:
-                self.object_mask[:] = 0
+            item = self.object_history.pop()
+            if isinstance(item, tuple) and len(item) == 3 and item[0] == "crop":
+                self.object_result = item[1]
+                self.object_bgr = item[2]
+            else:
+                self.object_result = item
+            if self.object_result is not None:
+                h, w = self.object_result.shape[:2]
+                self.object_mask = np.zeros((h,w), dtype=np.uint8)
+                self.selection_mask = self.object_mask.copy()
+            self.object_edit_mask = None
+            self.object_compare_original = False
             self.refresh_object_canvas()
 
     def restore_object_original(self):
         if self.object_bgr is not None:
-            self.object_result = self.object_bgr.copy()
+            base = self.object_full_original if isinstance(getattr(self, "object_full_original", None), np.ndarray) else self.object_bgr
+            self.object_bgr = base.copy()
+            self.object_result = base.copy()
             self.object_history = []
             if self.object_mask is not None:
                 self.object_mask[:] = 0
