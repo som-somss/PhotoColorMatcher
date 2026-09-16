@@ -94,6 +94,13 @@ def make_toolbar_icon(kind, size=34, fg="#f7f9fb"):
     elif kind == "remove":
         # clean X/delete symbol
         line([(7,7),(23,23)],width=w+2); line([(23,7),(7,23)],width=w+2)
+    elif kind == "cut_delete":
+        # Permanent cut/delete: scissors over a small selection box.
+        rect(5,5,24,24,width=max(3,w-2),r=1)
+        d.ellipse(box(4.5,18.0,10.5,24.0), outline=c, width=max(3,w-2))
+        d.ellipse(box(10.0,18.0,16.0,24.0), outline=c, width=max(3,w-2))
+        line([(8.5,18.5),(22.5,7.0)], width=max(4,w-1))
+        line([(13.0,18.5),(22.5,24.5)], width=max(4,w-1))
     elif kind == "color":
         # artist palette
         d.ellipse(box(4,5,25,24), outline=c, width=w)
@@ -395,6 +402,10 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_full_original = None
         self.crop_drag_start = None
         self.crop_preview_id = None
+        # V25 final-image crop: shrink the whole photo/canvas to hide blank cut areas.
+        self.canvas_crop_rect = None
+        self.canvas_crop_start = None
+        self.canvas_crop_preview_id = None
         # V15 selected-pixel move state
         self.move_drag_start = None
         self.move_base_result = None
@@ -405,6 +416,8 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_layers = []
         self.active_layer_index = None
         self.layer_background = None
+        self.layer_scale_var = tk.DoubleVar(value=100)
+        self._layer_scale_updating = False
         self._last_brush_point = None
         self.brush_size = tk.DoubleVar(value=35)
         self.inpaint_radius = tk.DoubleVar(value=5)
@@ -554,7 +567,6 @@ class PhotoColorMatcherApp(tk.Tk):
             return b
 
         add_icon("open", "사진 열기", self.open_object_image)
-        add_icon("crop", "영역 잘라서 이동", self.activate_crop_mode, "crop")
         add_icon("move", "선택 영역 잘라서 이동", self.activate_move_mode, "move")
         tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
         add_icon("rect", "사각형 선택", lambda: self.set_selection_tool("rect"), "rect")
@@ -566,7 +578,8 @@ class PhotoColorMatcherApp(tk.Tk):
         tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
         add_icon("color", "선택 색상 변경", self.apply_object_color)
         add_icon("blur", "브러시 블러", self.activate_blur_brush_mode, "blur_brush")
-        add_icon("remove", "선택 영역 삭제", self.run_object_removal)
+        add_icon("cut_delete", "선택 영역 완전 삭제 · 흰색 처리", self.delete_selection_to_white)
+        add_icon("remove", "선택 영역 삭제 · 주변 배경 복원", self.run_object_removal)
         add_icon("eyedrop", "질감 원본 선택 · Ctrl+D", self.activate_clone_source_mode, "clone_source")
         add_icon("clear", "질감 선택 해제", self.clear_clone_source)
         tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
@@ -622,6 +635,19 @@ class PhotoColorMatcherApp(tk.Tk):
         layer_btns.pack(fill="x", pady=(6, 0))
         ttk.Button(layer_btns, text="표시/숨김", command=self.toggle_active_layer_visibility).pack(fill="x")
         ttk.Button(layer_btns, text="레이어 삭제", command=self.delete_active_layer).pack(fill="x", pady=(4, 0))
+        size_row = ttk.Frame(layer_panel)
+        size_row.pack(fill="x", pady=(10, 0))
+        ttk.Label(size_row, text="객체 크기").pack(side="left")
+        self.layer_scale_label = ttk.Label(size_row, text="100%", width=6)
+        self.layer_scale_label.pack(side="right")
+        self.layer_scale_slider = ttk.Scale(layer_panel, from_=20, to=200, variable=self.layer_scale_var, command=self._on_layer_scale_change)
+        self.layer_scale_slider.pack(fill="x", pady=(3, 0))
+        ttk.Label(layer_panel, text="선택한 객체 레이어의 크기를\n20~200%로 조절할 수 있습니다.", justify="left").pack(anchor="w", pady=(3,0))
+        ttk.Separator(layer_panel, orient="horizontal").pack(fill="x", pady=(10,6))
+        ttk.Label(layer_panel, text="사진 전체 크기 줄이기", justify="left").pack(anchor="w")
+        ttk.Button(layer_panel, text="남길 영역 선택", command=self.activate_canvas_crop_mode).pack(fill="x", pady=(4,0))
+        ttk.Button(layer_panel, text="선택 영역으로 사진 자르기", command=self.apply_canvas_crop).pack(fill="x", pady=(4,0))
+        ttk.Label(layer_panel, text="흰 빈 공간을 제외하고 남길\n사진 영역을 드래그한 뒤 적용하세요.", justify="left").pack(anchor="w", pady=(3,0))
         ttk.Label(layer_panel, text="이동할 영역을 선택 후\n↔ 이동 아이콘을 누르면\n새 객체 레이어가 생성됩니다.", justify="left").pack(anchor="w", pady=(8,0))
 
         self.object_canvas.bind("<Button-1>", self.object_canvas_click)
@@ -738,7 +764,7 @@ class PhotoColorMatcherApp(tk.Tk):
             self.object_select_points = []
         self.hide_brush_preview()
         if hasattr(self, "object_canvas"):
-            cursor = "fleur" if tool == "move" else ("pencil" if tool in ("brush", "eraser", "blur_brush") else ("tcross" if tool == "crop" else "crosshair"))
+            cursor = "fleur" if tool == "move" else ("pencil" if tool in ("brush", "eraser", "blur_brush") else ("tcross" if tool in ("crop", "canvas_crop") else "crosshair"))
             self.object_canvas.configure(cursor=cursor)
         return "break"
 
@@ -767,7 +793,11 @@ class PhotoColorMatcherApp(tk.Tk):
         if idx < len(self.object_layers):
             self.active_layer_index = idx
             layer = self.object_layers[idx]
-            self.move_mask = self._shift_mask(layer["mask"], layer.get("dx",0), layer.get("dy",0))
+            self._layer_scale_updating = True
+            self.layer_scale_var.set(float(layer.get("scale", 1.0)) * 100.0)
+            if hasattr(self, "layer_scale_label"): self.layer_scale_label.config(text=f"{int(round(self.layer_scale_var.get()))}%")
+            self._layer_scale_updating = False
+            self.move_mask = self._layer_current_mask(layer)
             self.object_mask = self.move_mask.copy()
             self.selection_mask = self.move_mask.copy()
             self._set_remove_tool_bindings("move")
@@ -782,6 +812,36 @@ class PhotoColorMatcherApp(tk.Tk):
         out[ny[valid], nx[valid]] = 255
         return out
 
+    def _scaled_layer_data(self, layer):
+        """Return full-canvas scaled pixels/mask, scaled around the original mask center."""
+        mask = layer["mask"]
+        pixels = layer["pixels"]
+        h, w = mask.shape[:2]
+        scale = max(0.05, float(layer.get("scale", 1.0)))
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0:
+            return pixels, mask, 0, 0
+        x0,x1,y0,y1 = xs.min(),xs.max(),ys.min(),ys.max()
+        crop_m = mask[y0:y1+1, x0:x1+1]
+        crop_p = pixels[y0:y1+1, x0:x1+1]
+        nw=max(1,int(round(crop_m.shape[1]*scale))); nh=max(1,int(round(crop_m.shape[0]*scale)))
+        sm=cv2.resize(crop_m,(nw,nh),interpolation=cv2.INTER_NEAREST)
+        sp=cv2.resize(crop_p,(nw,nh),interpolation=cv2.INTER_CUBIC if scale>1 else cv2.INTER_AREA)
+        cx=(x0+x1)/2.0; cy=(y0+y1)/2.0
+        bx=int(round(cx-nw/2.0)); by=int(round(cy-nh/2.0))
+        return sp, sm, bx, by
+
+    def _layer_current_mask(self, layer):
+        h,w=layer["mask"].shape[:2]
+        out=np.zeros((h,w),dtype=np.uint8)
+        sp,sm,bx,by=self._scaled_layer_data(layer)
+        bx += int(layer.get("dx",0)); by += int(layer.get("dy",0))
+        y0=max(0,by); x0=max(0,bx); y1=min(h,by+sm.shape[0]); x1=min(w,bx+sm.shape[1])
+        if x1>x0 and y1>y0:
+            sy0=y0-by; sx0=x0-bx
+            out[y0:y1,x0:x1]=sm[sy0:sy0+(y1-y0),sx0:sx0+(x1-x0)]
+        return out
+
     def _compose_layers(self):
         if self.layer_background is None:
             if self.object_result is None: return None
@@ -789,16 +849,28 @@ class PhotoColorMatcherApp(tk.Tk):
         out = self.layer_background.copy()
         h, w = out.shape[:2]
         for layer in self.object_layers:
-            if not layer.get("visible", True):
-                continue
-            mask = layer["mask"]
-            pixels = layer["pixels"]
-            dx, dy = int(layer.get("dx",0)), int(layer.get("dy",0))
-            ys, xs = np.where(mask > 0)
-            nx, ny = xs + dx, ys + dy
-            valid = (nx >= 0) & (nx < w) & (ny >= 0) & (ny < h)
-            out[ny[valid], nx[valid], :3] = pixels[ys[valid], xs[valid], :3]
+            if not layer.get("visible", True): continue
+            sp,sm,bx,by=self._scaled_layer_data(layer)
+            bx += int(layer.get("dx",0)); by += int(layer.get("dy",0))
+            y0=max(0,by); x0=max(0,bx); y1=min(h,by+sm.shape[0]); x1=min(w,bx+sm.shape[1])
+            if x1<=x0 or y1<=y0: continue
+            sy0=y0-by; sx0=x0-bx
+            mm=sm[sy0:sy0+(y1-y0),sx0:sx0+(x1-x0)]>0
+            pp=sp[sy0:sy0+(y1-y0),sx0:sx0+(x1-x0)]
+            roi=out[y0:y1,x0:x1]
+            roi[mm]=pp[mm]
         return out
+
+    def _on_layer_scale_change(self, value=None):
+        if getattr(self,"_layer_scale_updating",False): return
+        pct=float(self.layer_scale_var.get())
+        if hasattr(self,"layer_scale_label"): self.layer_scale_label.config(text=f"{int(round(pct))}%")
+        if self.active_layer_index is None or not (0 <= self.active_layer_index < len(self.object_layers)): return
+        layer=self.object_layers[self.active_layer_index]
+        layer["scale"]=pct/100.0
+        self.move_mask=self._layer_current_mask(layer)
+        self.object_mask=self.move_mask.copy(); self.selection_mask=self.move_mask.copy()
+        self.object_result=self._compose_layers(); self.refresh_object_canvas()
 
     def toggle_active_layer_visibility(self):
         if self.active_layer_index is None or not (0 <= self.active_layer_index < len(self.object_layers)):
@@ -829,7 +901,7 @@ class PhotoColorMatcherApp(tk.Tk):
             # If a layer is selected in the panel, simply reactivate moving it.
             if self.active_layer_index is not None and 0 <= self.active_layer_index < len(self.object_layers):
                 layer = self.object_layers[self.active_layer_index]
-                self.move_mask = self._shift_mask(layer["mask"], layer.get("dx",0), layer.get("dy",0))
+                self.move_mask = self._layer_current_mask(layer)
                 self._set_remove_tool_bindings("move")
                 return "break"
             messagebox.showwarning(APP_TITLE, "먼저 이동할 영역을 선택해주세요.")
@@ -843,7 +915,7 @@ class PhotoColorMatcherApp(tk.Tk):
             "name": f"객체 {len(self.object_layers)+1}",
             "pixels": source,
             "mask": (mask > 0).astype(np.uint8) * 255,
-            "dx": 0, "dy": 0, "visible": True
+            "dx": 0, "dy": 0, "scale": 1.0, "visible": True
         }
         self.object_layers.append(layer)
         self.active_layer_index = len(self.object_layers)-1
@@ -867,7 +939,7 @@ class PhotoColorMatcherApp(tk.Tk):
         if self.active_layer_index is None or not (0 <= self.active_layer_index < len(self.object_layers)):
             return
         layer = self.object_layers[self.active_layer_index]
-        current_mask = self._shift_mask(layer["mask"], layer.get("dx",0), layer.get("dy",0))
+        current_mask = self._layer_current_mask(layer)
         x, y = self._canvas_to_image(event.x, event.y)
         h, w = current_mask.shape[:2]
         if 0 <= x < w and 0 <= y < h and current_mask[y,x] > 0:
@@ -881,7 +953,7 @@ class PhotoColorMatcherApp(tk.Tk):
         start_dx, start_dy = self.move_offset
         layer["dx"] = start_dx + (x-self.move_drag_start[0])
         layer["dy"] = start_dy + (y-self.move_drag_start[1])
-        self.move_mask = self._shift_mask(layer["mask"], layer["dx"], layer["dy"])
+        self.move_mask = self._layer_current_mask(layer)
         self.object_mask = self.move_mask.copy()
         self.selection_mask = self.move_mask.copy()
         self.object_result = self._compose_layers()
@@ -894,6 +966,136 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_result = self._compose_layers()
         self._refresh_layer_list(); self.refresh_object_canvas()
         self.object_select_status.config(text="이동 완료 · 배경은 변경되지 않았고 객체는 별도 레이어로 유지됩니다.")
+
+    def activate_canvas_crop_mode(self):
+        """Select the final photo bounds. This crops the whole canvas, not an object layer."""
+        if self.object_result is None:
+            messagebox.showwarning(APP_TITLE, "먼저 사진을 열어주세요.")
+            return "break"
+        self.clone_source_mode = False
+        self.canvas_crop_start = None
+        self.canvas_crop_rect = None
+        if self.canvas_crop_preview_id:
+            try: self.object_canvas.delete(self.canvas_crop_preview_id)
+            except Exception: pass
+            self.canvas_crop_preview_id = None
+        self._set_remove_tool_bindings("canvas_crop")
+        self.object_select_status.config(text="사진 크기 줄이기 · 최종 사진으로 남길 영역을 사각형으로 드래그하세요.")
+        return "break"
+
+    def canvas_crop_select_start(self, event):
+        self.canvas_crop_start = (event.x, event.y)
+        self.canvas_crop_rect = None
+        if self.canvas_crop_preview_id:
+            try: self.object_canvas.delete(self.canvas_crop_preview_id)
+            except Exception: pass
+            self.canvas_crop_preview_id = None
+
+    def canvas_crop_select_drag(self, event):
+        if not self.canvas_crop_start:
+            return
+        x0, y0 = self.canvas_crop_start
+        if self.canvas_crop_preview_id:
+            try: self.object_canvas.delete(self.canvas_crop_preview_id)
+            except Exception: pass
+        self.canvas_crop_preview_id = self.object_canvas.create_rectangle(
+            x0, y0, event.x, event.y, outline="#ffffff", width=2, dash=(7,4))
+
+    def canvas_crop_select_end(self, event):
+        if not self.canvas_crop_start or self.object_result is None:
+            return
+        x0, y0 = self.canvas_crop_start
+        self.canvas_crop_start = None
+        ix0, iy0 = self._canvas_to_image_xy(x0, y0)
+        ix1, iy1 = self._canvas_to_image_xy(event.x, event.y)
+        left, right = sorted((ix0, ix1)); top, bottom = sorted((iy0, iy1))
+        h, w = self.object_result.shape[:2]
+        left=max(0,min(w-1,left)); right=max(1,min(w,right))
+        top=max(0,min(h-1,top)); bottom=max(1,min(h,bottom))
+        if right-left < 10 or bottom-top < 10:
+            self.canvas_crop_rect = None
+            self.object_select_status.config(text="선택 영역이 너무 작습니다. 다시 드래그하세요.")
+            return
+        self.canvas_crop_rect = (left, top, right, bottom)
+        self.object_select_status.config(text=f"사진 크기 선택 완료 · {right-left} × {bottom-top}px · 오른쪽 '선택 영역으로 사진 자르기'를 누르세요.")
+
+    def _flatten_layer_to_canvas(self, layer, h, w):
+        """Render one object layer into full-canvas pixels/mask without touching the background."""
+        full_pixels = np.zeros((h, w, 3), dtype=np.uint8)
+        full_mask = np.zeros((h, w), dtype=np.uint8)
+        sp, sm, bx, by = self._scaled_layer_data(layer)
+        bx += int(layer.get("dx", 0)); by += int(layer.get("dy", 0))
+        y0=max(0,by); x0=max(0,bx); y1=min(h,by+sm.shape[0]); x1=min(w,bx+sm.shape[1])
+        if x1>x0 and y1>y0:
+            sy0=y0-by; sx0=x0-bx
+            subm=sm[sy0:sy0+(y1-y0), sx0:sx0+(x1-x0)]
+            subp=sp[sy0:sy0+(y1-y0), sx0:sx0+(x1-x0)]
+            full_mask[y0:y1,x0:x1]=subm
+            mm=subm>0
+            roi=full_pixels[y0:y1,x0:x1]
+            roi[mm]=subp[mm]
+        return full_pixels, full_mask
+
+    def apply_canvas_crop(self):
+        """Crop the entire working photo while preserving object layers as independent layers."""
+        if self.object_result is None:
+            messagebox.showwarning(APP_TITLE, "먼저 사진을 열어주세요.")
+            return "break"
+        if not self.canvas_crop_rect:
+            messagebox.showinfo(APP_TITLE, "먼저 '남길 영역 선택'을 누르고 사진에 남길 영역을 드래그해주세요.")
+            return "break"
+        left, top, right, bottom = self.canvas_crop_rect
+        h, w = self.object_result.shape[:2]
+        left=max(0,min(w-1,left)); right=max(left+1,min(w,right))
+        top=max(0,min(h-1,top)); bottom=max(top+1,min(h,bottom))
+
+        # Save undo snapshot before changing dimensions.
+        try:
+            self.object_history.append(self.object_result.copy())
+        except Exception:
+            pass
+
+        # Preserve the current independent layers by rendering each layer into
+        # the current canvas first, then rebasing it into the cropped canvas.
+        rebased=[]
+        for layer in self.object_layers:
+            fp, fm = self._flatten_layer_to_canvas(layer, h, w)
+            cp = fp[top:bottom, left:right].copy()
+            cm = fm[top:bottom, left:right].copy()
+            if np.any(cm):
+                rebased.append({
+                    "name": layer.get("name", f"객체 {len(rebased)+1}"),
+                    "pixels": cp, "mask": cm,
+                    "dx": 0, "dy": 0, "scale": 1.0,
+                    "visible": layer.get("visible", True)
+                })
+
+        base = self.layer_background if self.layer_background is not None else self.object_result
+        self.layer_background = base[top:bottom, left:right].copy()
+        self.object_layers = rebased
+        self.active_layer_index = None
+        self.object_result = self._compose_layers()
+        self.object_bgr = self.object_result.copy()
+        if isinstance(self.object_full_original, np.ndarray):
+            oh, ow = self.object_full_original.shape[:2]
+            if bottom <= oh and right <= ow:
+                self.object_full_original = self.object_full_original[top:bottom, left:right].copy()
+
+        nh, nw = self.object_result.shape[:2]
+        self.object_mask = np.zeros((nh,nw),dtype=np.uint8)
+        self.selection_mask = self.object_mask.copy()
+        self.object_edit_mask = self.object_mask.copy()
+        self.move_mask = None
+        self.canvas_crop_rect = None
+        if self.canvas_crop_preview_id:
+            try: self.object_canvas.delete(self.canvas_crop_preview_id)
+            except Exception: pass
+            self.canvas_crop_preview_id = None
+        self._refresh_layer_list()
+        self._set_remove_tool_bindings("rect")
+        self.refresh_object_canvas()
+        self.object_select_status.config(text=f"사진 크기 줄이기 완료 · 현재 크기 {nw} × {nh}px · 잘라낸 바깥 영역은 제거되었습니다.")
+        return "break"
 
     def activate_crop_mode(self):
         """Select a rectangular area to cut and immediately prepare it for moving."""
@@ -1441,6 +1643,10 @@ class PhotoColorMatcherApp(tk.Tk):
             self.crop_select_start(event)
             return "break"
 
+        if tool == "canvas_crop":
+            self.canvas_crop_select_start(event)
+            return "break"
+
         if tool in ("rect", "ellipse"):
             self.shape_select_start(event)
             return "break"
@@ -1485,6 +1691,8 @@ class PhotoColorMatcherApp(tk.Tk):
             self.move_selection_drag(event)
         elif tool == "crop":
             self.crop_select_drag(event)
+        elif tool == "canvas_crop":
+            self.canvas_crop_select_drag(event)
         elif tool in ("rect", "ellipse"):
             self.shape_select_drag(event)
         elif tool == "brush":
@@ -1500,6 +1708,8 @@ class PhotoColorMatcherApp(tk.Tk):
             self.move_selection_end(event)
         elif self.active_remove_tool == "crop":
             self.crop_select_end(event)
+        elif self.active_remove_tool == "canvas_crop":
+            self.canvas_crop_select_end(event)
         elif self.active_remove_tool in ("rect", "ellipse"):
             self.shape_select_end(event)
         elif self.active_remove_tool == "blur_brush":
@@ -1621,6 +1831,31 @@ class PhotoColorMatcherApp(tk.Tk):
             if hasattr(self, "object_select_status"):
                 self.object_select_status.config(text="선택을 지웠습니다.")
             self.refresh_object_canvas()
+
+    def delete_selection_to_white(self):
+        """Permanently remove the current selection by filling it with white. No layer is created."""
+        if self.object_result is None:
+            messagebox.showwarning(APP_TITLE, "먼저 사진을 열어주세요.")
+            return
+        mask=getattr(self,"object_mask",None)
+        if not (isinstance(mask,np.ndarray) and mask.size and np.any(mask>0)):
+            mask=getattr(self,"selection_mask",None)
+        if not (isinstance(mask,np.ndarray) and mask.size and np.any(mask>0)):
+            messagebox.showinfo(APP_TITLE, "먼저 완전히 삭제할 영역을 선택해주세요.")
+            return
+        # Save the current composited image for the normal Undo command.
+        self.object_history.append(self.object_result.copy())
+        # White deletion belongs to the background; independent object layers stay independent.
+        if self.layer_background is None:
+            self.layer_background=self.object_result.copy()
+        self.layer_background[mask>0]=(255,255,255)
+        self.object_result=self._compose_layers() if self.object_layers else self.layer_background.copy()
+        self.object_mask[:]=0
+        self.selection_mask=self.object_mask.copy()
+        self.object_edit_mask=None
+        self.refresh_object_canvas()
+        if hasattr(self,"object_select_status"):
+            self.object_select_status.config(text="선택 영역을 완전히 삭제하여 흰색으로 처리했습니다.")
 
     def run_object_removal(self):
         if self.object_result is None:
