@@ -376,6 +376,7 @@ class PhotoColorMatcherApp(tk.Tk):
         ttk.Button(bar, text="타원형 선택", command=lambda: self.set_selection_tool("ellipse")).pack(side="left", padx=3)
         ttk.Button(bar, text="직접 선택", command=lambda: self.set_selection_tool("free")).pack(side="left", padx=3)
         ttk.Button(bar, text="브러시", command=self.activate_brush_mode).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="마스크 지우개", command=self.activate_mask_eraser_mode).pack(side="left", padx=3)
         ttk.Button(bar, text="선택 색상 변경", command=self.apply_object_color).pack(side="left", padx=6)
         ttk.Button(bar, text="선택 영역 삭제", command=self.run_object_removal).pack(side="left", padx=6)
         ttk.Button(bar, text="마스크 지우기", command=self.clear_object_mask).pack(side="left")
@@ -505,7 +506,7 @@ class PhotoColorMatcherApp(tk.Tk):
             self.object_select_points = []
         self.hide_brush_preview()
         if hasattr(self, "object_canvas"):
-            self.object_canvas.configure(cursor="pencil" if tool == "brush" else "crosshair")
+            self.object_canvas.configure(cursor="pencil" if tool in ("brush", "eraser") else "crosshair")
         return "break"
 
     def set_selection_tool(self, tool):
@@ -719,6 +720,15 @@ class PhotoColorMatcherApp(tk.Tk):
         try: self.status_var.set("브러시 모드: 드래그하여 마스크를 칠하세요.")
         except Exception: pass
 
+    def activate_mask_eraser_mode(self):
+        """Erase only the painted/selected mask without changing image pixels."""
+        self.clone_source_mode = False
+        self._set_remove_tool_bindings("eraser")
+        if hasattr(self, "object_select_status"):
+            self.object_select_status.config(text="마스크 지우개 모드 · 드래그하여 불필요하게 선택된 부분만 지우세요.")
+        try: self.status_var.set("마스크 지우개: 빨간 선택 영역 중 불필요한 부분을 드래그하여 지웁니다.")
+        except Exception: pass
+
     def finish_manual_selection(self):
         if self.object_result is None or len(self.object_select_points) < 3:
             self.object_select_status.config(text="최소 3개 이상의 점을 찍어주세요.")
@@ -870,6 +880,8 @@ class PhotoColorMatcherApp(tk.Tk):
 
         if tool == "brush":
             self.paint_object_mask(event)
+        elif tool == "eraser":
+            self.erase_object_mask(event)
         return "break"
 
     def object_canvas_drag(self, event):
@@ -878,6 +890,8 @@ class PhotoColorMatcherApp(tk.Tk):
             self.shape_select_drag(event)
         elif tool == "brush":
             self.paint_object_mask(event)
+        elif tool == "eraser":
+            self.erase_object_mask(event)
         return "break"
 
     def object_canvas_release(self, event):
@@ -889,7 +903,7 @@ class PhotoColorMatcherApp(tk.Tk):
         """현재 브러시 크기를 마우스 위치에 빨간 원으로 표시."""
         if self.object_result is None:
             return
-        if self.active_remove_tool != "brush":
+        if self.active_remove_tool not in ("brush", "eraser"):
             self.hide_brush_preview()
             return
         if self.brush_preview_id is not None:
@@ -902,7 +916,8 @@ class PhotoColorMatcherApp(tk.Tk):
         self.brush_preview_id = self.object_canvas.create_oval(
             event.x - radius, event.y - radius,
             event.x + radius, event.y + radius,
-            outline="#ff3b30", width=2, tags=("brush_preview",)
+            outline="#00e5ff" if self.active_remove_tool == "eraser" else "#ff3b30",
+            width=2, tags=("brush_preview",)
         )
         self.object_canvas.tag_raise(self.brush_preview_id)
 
@@ -925,6 +940,28 @@ class PhotoColorMatcherApp(tk.Tk):
         if 0 <= x < w and 0 <= y < h:
             radius = max(1, int(self.brush_size.get() / max(scale, 1e-6) / 2))
             cv2.circle(self.object_mask, (x, y), radius, 255, -1)
+            if hasattr(self, "selection_mask") and isinstance(self.selection_mask, np.ndarray) and self.selection_mask.shape == self.object_mask.shape:
+                cv2.circle(self.selection_mask, (x, y), radius, 255, -1)
+            self.refresh_object_canvas()
+            self.show_brush_preview(event)
+
+    def erase_object_mask(self, event):
+        """Erase from the current selection mask using the same adjustable brush size."""
+        if self.object_result is None or self.object_mask is None:
+            return
+        scale = max(self.object_display_scale, 1e-6)
+        ox, oy = self.object_display_offset
+        x = int((event.x - ox) / scale)
+        y = int((event.y - oy) / scale)
+        h, w = self.object_mask.shape
+        if 0 <= x < w and 0 <= y < h:
+            radius = max(1, int(self.brush_size.get() / scale / 2))
+            cv2.circle(self.object_mask, (x, y), radius, 0, -1)
+            # Keep the auxiliary edit mask consistent when it exists.
+            if isinstance(self.object_edit_mask, np.ndarray) and self.object_edit_mask.shape == self.object_mask.shape:
+                cv2.circle(self.object_edit_mask, (x, y), radius, 0, -1)
+            if hasattr(self, "selection_mask") and isinstance(self.selection_mask, np.ndarray) and self.selection_mask.shape == self.object_mask.shape:
+                cv2.circle(self.selection_mask, (x, y), radius, 0, -1)
             self.refresh_object_canvas()
             self.show_brush_preview(event)
 
