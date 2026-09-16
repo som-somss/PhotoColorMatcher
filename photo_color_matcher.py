@@ -625,10 +625,10 @@ class PhotoColorMatcherApp(tk.Tk):
         self._toolbar_images = {}
         self._tool_buttons = {}
 
-        def add_icon(kind, tip, command, tool_key=None, gap=2):
-            img = ImageTk.PhotoImage(make_toolbar_icon(kind, 28))
+        def add_icon(kind, tip, command, tool_key=None, gap=1):
+            img = ImageTk.PhotoImage(make_toolbar_icon(kind, 22))
             self._toolbar_images[tip] = img
-            b = tk.Button(bar, image=img, command=command, width=38, height=38,
+            b = tk.Button(bar, image=img, command=command, width=30, height=30,
                           bg="#343b42", activebackground="#2387f3", relief="flat", bd=0,
                           highlightthickness=1, highlightbackground="#4a535c", cursor="hand2")
             b.pack(side="left", padx=gap)
@@ -638,7 +638,7 @@ class PhotoColorMatcherApp(tk.Tk):
 
         add_icon("open", "사진 열기", self.open_object_image)
         add_icon("move", "선택 영역 잘라서 이동 · M", self.activate_move_mode, "move")
-        tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
+        tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=4)
         add_icon("rect", "사각형 선택 · R", lambda: self.set_selection_tool("rect"), "rect")
         add_icon("ellipse", "타원형 선택 · O", lambda: self.set_selection_tool("ellipse"), "ellipse")
         add_icon("lasso", "직접 선택 · L", lambda: self.set_selection_tool("free"), "free")
@@ -646,7 +646,7 @@ class PhotoColorMatcherApp(tk.Tk):
         add_icon("eraser", "브러시 마킹 지우기 · E", self.activate_mask_eraser_mode, "eraser")
         add_icon("subtract_lasso", "선택영역 일부 해제 · X", self.activate_selection_subtract_mode, "free_subtract")
         add_icon("deselect", "선택영역 전체 해제 · Ctrl+D", self.clear_all_selection)
-        tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
+        tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=4)
         add_icon("color", "선택 색상 변경", self.apply_object_color)
         add_icon("blur", "브러시 블러 · U", self.activate_blur_brush_mode, "blur_brush")
         add_icon("liquify", "성형 · 드래그하여 밀기 · W", self.activate_liquify_mode, "liquify")
@@ -657,7 +657,7 @@ class PhotoColorMatcherApp(tk.Tk):
         add_icon("remove", "선택 영역 삭제 · 주변 배경 복원", self.run_object_removal)
         add_icon("eyedrop", "질감 원본 선택 · Ctrl+Shift+D", self.activate_clone_source_mode, "clone_source")
         add_icon("clear", "질감 선택 해제 · Q", self.clear_clone_source)
-        tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
+        tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=4)
         add_icon("compare", "원본/결과 비교 · C", self.toggle_object_compare, "compare")
         add_icon("undo", "실행 취소 · Ctrl+Z", self.undo_object_removal)
         add_icon("reset", "원본 복원", self.restore_object_original)
@@ -868,6 +868,13 @@ class PhotoColorMatcherApp(tk.Tk):
         idx = sel[0] - 1
         if idx < 0:
             self.active_layer_index = None
+            if isinstance(self.object_result, np.ndarray):
+                shape = self.object_result.shape[:2]
+                self.object_mask = np.zeros(shape, dtype=np.uint8)
+                self.selection_mask = np.zeros(shape, dtype=np.uint8)
+                self.object_edit_mask = np.zeros(shape, dtype=np.uint8)
+            self._set_remove_tool_bindings("none")
+            self.refresh_object_canvas()
             return
         if idx < len(self.object_layers):
             self.active_layer_index = idx
@@ -877,8 +884,12 @@ class PhotoColorMatcherApp(tk.Tk):
             if hasattr(self, "layer_scale_label"): self.layer_scale_label.config(text=f"{int(round(self.layer_scale_var.get()))}%")
             self._layer_scale_updating = False
             self.move_mask = self._layer_current_mask(layer)
-            self.object_mask = self.move_mask.copy()
-            self.selection_mask = self.move_mask.copy()
+            # Layer selection and pixel-selection masks are intentionally separate.
+            # Selecting an object layer must not cover it with the red edit mask.
+            shape = self.object_result.shape[:2]
+            self.object_mask = np.zeros(shape, dtype=np.uint8)
+            self.selection_mask = np.zeros(shape, dtype=np.uint8)
+            self.object_edit_mask = np.zeros(shape, dtype=np.uint8)
             self._set_remove_tool_bindings("move")
             self.refresh_object_canvas()
 
@@ -948,7 +959,6 @@ class PhotoColorMatcherApp(tk.Tk):
         layer=self.object_layers[self.active_layer_index]
         layer["scale"]=pct/100.0
         self.move_mask=self._layer_current_mask(layer)
-        self.object_mask=self.move_mask.copy(); self.selection_mask=self.move_mask.copy()
         self.object_result=self._compose_layers(); self.refresh_object_canvas()
 
     def toggle_active_layer_visibility(self):
@@ -1033,8 +1043,6 @@ class PhotoColorMatcherApp(tk.Tk):
         layer["dx"] = start_dx + (x-self.move_drag_start[0])
         layer["dy"] = start_dy + (y-self.move_drag_start[1])
         self.move_mask = self._layer_current_mask(layer)
-        self.object_mask = self.move_mask.copy()
-        self.selection_mask = self.move_mask.copy()
         self.object_result = self._compose_layers()
         self.refresh_object_canvas()
 
@@ -1401,6 +1409,18 @@ class PhotoColorMatcherApp(tk.Tk):
                 contours, _ = cv2.findContours((em > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(disp, contours, -1, (60, 255, 80), 2)
 
+        # Object-layer selection is shown only as a thin outline, never as a red overlay.
+        # Hide the guide while painting effects so the real texture stays unobstructed.
+        if (not getattr(self, "object_compare_original", False) and
+            self.active_layer_index is not None and
+            0 <= self.active_layer_index < len(self.object_layers) and
+            self.active_remove_tool not in ("blur_brush", "liquify", "bloat", "freeze", "unfreeze")):
+            lm = self._layer_current_mask(self.object_layers[self.active_layer_index])
+            if isinstance(lm, np.ndarray) and np.any(lm):
+                lm2 = cv2.resize(lm, (dw, dh), interpolation=cv2.INTER_NEAREST)
+                contours, _ = cv2.findContours((lm2 > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(disp, contours, -1, (80, 220, 255), 1, cv2.LINE_AA)
+
         if self.object_select_mode and self.object_select_points:
             pts_disp = [(int(px * scale), int(py * scale)) for px, py in self.object_select_points]
             if len(pts_disp) >= 2:
@@ -1696,7 +1716,7 @@ class PhotoColorMatcherApp(tk.Tk):
             self.object_select_status.config(text=f"성형 적용 완료 · 강도 {int(self.liquify_strength.get())} · W로 계속 작업하거나 Ctrl+Z로 실행 취소")
 
     def activate_blur_brush_mode(self):
-        """Photoshop-like blur brush: paint only where blur is wanted."""
+        """Blur brush. When an object layer is active, only that layer is edited."""
         if self.object_result is None:
             messagebox.showwarning(APP_TITLE, "먼저 사진을 열어주세요.")
             return "break"
@@ -1704,18 +1724,27 @@ class PhotoColorMatcherApp(tk.Tk):
         self._set_remove_tool_bindings("blur_brush")
         self._blur_stroke_mask = np.zeros(self.object_result.shape[:2], dtype=np.uint8)
         self._blur_stroke_base = None
+        self._blur_stroke_layer = None
+        self._blur_stroke_valid = None
         if hasattr(self, "object_select_status"):
-            self.object_select_status.config(text="블러 브러시 · 원하는 부분을 드래그하세요. 파란 원이 브러시 크기를 표시합니다.")
-        try: self.status_var.set("블러 브러시: 원하는 부분만 마우스로 칠하세요.")
-        except Exception: pass
+            target = (self.object_layers[self.active_layer_index].get("name", "객체")
+                      if self.active_layer_index is not None and 0 <= self.active_layer_index < len(self.object_layers)
+                      else "배경")
+            self.object_select_status.config(text=f"블러 브러시 · {target}만 편집 · 원하는 부분을 드래그하세요.")
         return "break"
 
     def _paint_blur_stroke(self, event):
         if self.object_result is None:
             return
         if getattr(self, "_blur_stroke_base", None) is None:
-            self._blur_stroke_base = self.object_result.copy()
-            self._blur_stroke_mask = np.zeros(self.object_result.shape[:2], dtype=np.uint8)
+            base, valid, layer = self._active_layer_edit_target()
+            if base is None:
+                return
+            self._blur_stroke_base = base.copy()
+            self._blur_stroke_valid = None if valid is None else valid.copy()
+            self._blur_stroke_layer = layer
+            self._blur_stroke_mask = np.zeros(base.shape[:2], dtype=np.uint8)
+
         scale=max(self.object_display_scale,1e-6); ox,oy=self.object_display_offset
         x=int((event.x-ox)/scale); y=int((event.y-oy)/scale)
         h,w=self._blur_stroke_mask.shape
@@ -1725,26 +1754,33 @@ class PhotoColorMatcherApp(tk.Tk):
         if prev is not None: cv2.line(self._blur_stroke_mask,prev,(x,y),255,radius*2,cv2.LINE_AA)
         cv2.circle(self._blur_stroke_mask,(x,y),radius,255,-1,cv2.LINE_AA)
         self._last_brush_point=(x,y)
+
         strength=max(1,min(100,int(round(self.blur_strength.get()))))
         sigma=0.6+(strength/100.0)*24.0
         base=self._blur_stroke_base
+        valid=self._blur_stroke_valid
         blurred=cv2.GaussianBlur(base,(0,0),sigmaX=sigma,sigmaY=sigma,borderType=cv2.BORDER_REFLECT)
         alpha=cv2.GaussianBlur(self._blur_stroke_mask,(0,0),0.8).astype(np.float32)/255.0
-        if base.ndim==3: alpha=alpha[...,None]
-        self.object_result=(base.astype(np.float32)*(1-alpha)+blurred.astype(np.float32)*alpha).clip(0,255).astype(np.uint8)
+        if valid is not None:
+            # Never let an object-layer effect spill into the background.
+            alpha *= (valid.astype(np.float32)/255.0)
+        alpha3=alpha[...,None] if base.ndim==3 else alpha
+        edited=(base.astype(np.float32)*(1-alpha3)+blurred.astype(np.float32)*alpha3).clip(0,255).astype(np.uint8)
+        if valid is not None:
+            edited[valid==0]=0
+        self._commit_active_layer_edit(edited, valid, self._blur_stroke_layer)
+        self.object_compare_original=False
         self.refresh_object_canvas(); self.show_brush_preview(event)
 
     def _finish_blur_stroke(self):
-        base=getattr(self,"_blur_stroke_base",None)
-        mask=getattr(self,"_blur_stroke_mask",None)
-        if base is not None and isinstance(mask,np.ndarray) and np.any(mask):
-            self.object_history.append(base.copy())
         self._blur_stroke_base=None
+        self._blur_stroke_layer=None
+        self._blur_stroke_valid=None
         if self.object_result is not None:
             self._blur_stroke_mask=np.zeros(self.object_result.shape[:2],dtype=np.uint8)
         self._last_brush_point=None
         if hasattr(self,"object_select_status"):
-            self.object_select_status.config(text=f"블러 적용 완료 · 강도 {int(self.blur_strength.get())} · 계속 칠하거나 실행 취소할 수 있습니다.")
+            self.object_select_status.config(text=f"블러 적용 완료 · 강도 {int(self.blur_strength.get())}")
 
     def apply_selection_blur(self):
         """Blur only the currently selected mask while preserving a natural edge."""
