@@ -452,6 +452,11 @@ class PhotoColorMatcherApp(tk.Tk):
         self.layer_background = None
         self.layer_scale_var = tk.DoubleVar(value=100)
         self._layer_scale_updating = False
+        # V34 layer controls / automatic selection / edge refinement
+        self.layer_opacity_var = tk.DoubleVar(value=100)
+        self._layer_opacity_updating = False
+        self.refine_feather_var = tk.DoubleVar(value=2)
+        self.refine_expand_var = tk.DoubleVar(value=0)
         self._last_brush_point = None
         self.brush_size = tk.DoubleVar(value=35)
         self.inpaint_radius = tk.DoubleVar(value=5)
@@ -525,6 +530,10 @@ class PhotoColorMatcherApp(tk.Tk):
         self.bind_all("<Delete>", lambda e: self.delete_selection_to_white())
         self.bind_all("<Key-q>", lambda e: self.clear_clone_source())
         self.bind_all("<Key-Q>", lambda e: self.clear_clone_source())
+        self.bind_all("<Key-a>", lambda e: self.activate_auto_select_mode())
+        self.bind_all("<Key-A>", lambda e: self.activate_auto_select_mode())
+        self.bind_all("<Control-j>", lambda e: self.duplicate_active_layer())
+        self.bind_all("<Control-J>", lambda e: self.duplicate_active_layer())
 
     def _build_ui(self):
         notebook = ttk.Notebook(self)
@@ -643,6 +652,7 @@ class PhotoColorMatcherApp(tk.Tk):
         add_icon("open", "사진 열기", self.open_object_image)
         add_icon("move", "선택 영역 잘라서 이동 · M", self.activate_move_mode, "move")
         tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=4)
+        add_icon("lasso", "자동 객체 선택 · A · 객체를 클릭", self.activate_auto_select_mode, "auto_select")
         add_icon("rect", "사각형 선택 · R", lambda: self.set_selection_tool("rect"), "rect")
         add_icon("ellipse", "타원형 선택 · O", lambda: self.set_selection_tool("ellipse"), "ellipse")
         add_icon("lasso", "직접 선택 · L", lambda: self.set_selection_tool("free"), "free")
@@ -719,7 +729,24 @@ class PhotoColorMatcherApp(tk.Tk):
         layer_btns = ttk.Frame(layer_panel)
         layer_btns.pack(fill="x", pady=(6, 0))
         ttk.Button(layer_btns, text="표시/숨김", command=self.toggle_active_layer_visibility).pack(fill="x")
+        order_row = ttk.Frame(layer_btns); order_row.pack(fill="x", pady=(4,0))
+        ttk.Button(order_row, text="▲ 위로", command=lambda: self.move_active_layer_order(+1)).pack(side="left", fill="x", expand=True)
+        ttk.Button(order_row, text="▼ 아래로", command=lambda: self.move_active_layer_order(-1)).pack(side="left", fill="x", expand=True, padx=(4,0))
+        ttk.Button(layer_btns, text="레이어 복제 (Ctrl+J)", command=self.duplicate_active_layer).pack(fill="x", pady=(4, 0))
         ttk.Button(layer_btns, text="레이어 삭제", command=self.delete_active_layer).pack(fill="x", pady=(4, 0))
+        op_row = ttk.Frame(layer_panel); op_row.pack(fill="x", pady=(8,0))
+        ttk.Label(op_row, text="불투명도").pack(side="left")
+        self.layer_opacity_label = ttk.Label(op_row, text="100%", width=6); self.layer_opacity_label.pack(side="right")
+        ttk.Scale(layer_panel, from_=0, to=100, variable=self.layer_opacity_var, command=self._on_layer_opacity_change).pack(fill="x", pady=(2,4))
+        ttk.Separator(layer_panel, orient="horizontal").pack(fill="x", pady=(5,5))
+        ttk.Label(layer_panel, text="선택영역 경계 다듬기").pack(anchor="w")
+        refine1=ttk.Frame(layer_panel); refine1.pack(fill="x")
+        ttk.Label(refine1,text="부드럽게").pack(side="left")
+        ttk.Scale(refine1,from_=0,to=20,variable=self.refine_feather_var,length=105).pack(side="right")
+        refine2=ttk.Frame(layer_panel); refine2.pack(fill="x")
+        ttk.Label(refine2,text="확장/축소").pack(side="left")
+        ttk.Scale(refine2,from_=-20,to=20,variable=self.refine_expand_var,length=105).pack(side="right")
+        ttk.Button(layer_panel,text="경계 다듬기 적용",command=self.apply_refine_edge).pack(fill="x",pady=(3,6))
         size_row = ttk.Frame(layer_panel)
         size_row.pack(fill="x", pady=(10, 0))
         ttk.Label(size_row, text="객체 크기").pack(side="left")
@@ -877,6 +904,10 @@ class PhotoColorMatcherApp(tk.Tk):
                 self.object_mask = np.zeros(shape, dtype=np.uint8)
                 self.selection_mask = np.zeros(shape, dtype=np.uint8)
                 self.object_edit_mask = np.zeros(shape, dtype=np.uint8)
+            self._layer_opacity_updating=True
+            self.layer_opacity_var.set(100)
+            if hasattr(self,"layer_opacity_label"): self.layer_opacity_label.config(text="100%")
+            self._layer_opacity_updating=False
             self._set_remove_tool_bindings("none")
             self.refresh_object_canvas()
             return
@@ -887,6 +918,10 @@ class PhotoColorMatcherApp(tk.Tk):
             self.layer_scale_var.set(float(layer.get("scale", 1.0)) * 100.0)
             if hasattr(self, "layer_scale_label"): self.layer_scale_label.config(text=f"{int(round(self.layer_scale_var.get()))}%")
             self._layer_scale_updating = False
+            self._layer_opacity_updating = True
+            self.layer_opacity_var.set(float(layer.get("opacity", 1.0)) * 100.0)
+            if hasattr(self, "layer_opacity_label"): self.layer_opacity_label.config(text=f"{int(round(self.layer_opacity_var.get()))}%")
+            self._layer_opacity_updating = False
             self.move_mask = self._layer_current_mask(layer)
             # Layer selection and pixel-selection masks are intentionally separate.
             # Selecting an object layer must not cover it with the red edit mask.
@@ -949,10 +984,12 @@ class PhotoColorMatcherApp(tk.Tk):
             y0=max(0,by); x0=max(0,bx); y1=min(h,by+sm.shape[0]); x1=min(w,bx+sm.shape[1])
             if x1<=x0 or y1<=y0: continue
             sy0=y0-by; sx0=x0-bx
-            mm=sm[sy0:sy0+(y1-y0),sx0:sx0+(x1-x0)]>0
-            pp=sp[sy0:sy0+(y1-y0),sx0:sx0+(x1-x0)]
-            roi=out[y0:y1,x0:x1]
-            roi[mm]=pp[mm]
+            mm=sm[sy0:sy0+(y1-y0),sx0:sx0+(x1-x0)].astype(np.float32) / 255.0
+            mm *= float(np.clip(layer.get("opacity", 1.0), 0.0, 1.0))
+            pp=sp[sy0:sy0+(y1-y0),sx0:sx0+(x1-x0)].astype(np.float32)
+            roi=out[y0:y1,x0:x1].astype(np.float32)
+            a=mm[...,None]
+            out[y0:y1,x0:x1]=np.clip(pp*a + roi*(1.0-a),0,255).astype(np.uint8)
         return out
 
     def _on_layer_scale_change(self, value=None):
@@ -964,6 +1001,115 @@ class PhotoColorMatcherApp(tk.Tk):
         layer["scale"]=pct/100.0
         self.move_mask=self._layer_current_mask(layer)
         self.object_result=self._compose_layers(); self.refresh_object_canvas()
+
+    def _on_layer_opacity_change(self, value=None):
+        if getattr(self, "_layer_opacity_updating", False):
+            return
+        pct=float(self.layer_opacity_var.get())
+        if hasattr(self,"layer_opacity_label"):
+            self.layer_opacity_label.config(text=f"{int(round(pct))}%")
+        if self.active_layer_index is None or not (0 <= self.active_layer_index < len(self.object_layers)):
+            return
+        self.object_layers[self.active_layer_index]["opacity"] = pct / 100.0
+        self.object_result=self._compose_layers(); self.refresh_object_canvas()
+
+    def move_active_layer_order(self, direction):
+        """Move selected object forward/backward in the compositing stack."""
+        i=self.active_layer_index
+        if i is None or not (0 <= i < len(self.object_layers)):
+            messagebox.showinfo(APP_TITLE,"이동할 객체 레이어를 선택해주세요."); return
+        j=i + (1 if direction > 0 else -1)
+        if not (0 <= j < len(self.object_layers)):
+            return
+        self.object_layers[i], self.object_layers[j] = self.object_layers[j], self.object_layers[i]
+        self.active_layer_index=j
+        self.object_result=self._compose_layers(); self._refresh_layer_list(); self.refresh_object_canvas()
+
+    def duplicate_active_layer(self, event=None):
+        import copy
+        i=self.active_layer_index
+        if i is None or not (0 <= i < len(self.object_layers)):
+            messagebox.showinfo(APP_TITLE,"복제할 객체 레이어를 선택해주세요."); return "break"
+        src=self.object_layers[i]
+        dup={k:(v.copy() if isinstance(v,np.ndarray) else copy.deepcopy(v)) for k,v in src.items()}
+        base=src.get("name",f"객체 {i+1}")
+        dup["name"]=f"{base} 복사본"
+        dup["dx"]=int(dup.get("dx",0))+12; dup["dy"]=int(dup.get("dy",0))+12
+        self.object_layers.insert(i+1,dup); self.active_layer_index=i+1
+        self.object_result=self._compose_layers(); self._refresh_layer_list(); self.refresh_object_canvas()
+        return "break"
+
+    def apply_refine_edge(self):
+        """Expand/contract and feather the current pixel selection without changing image pixels."""
+        mask=getattr(self,"object_mask",None)
+        if not isinstance(mask,np.ndarray) or not np.any(mask):
+            mask=getattr(self,"selection_mask",None)
+        if not isinstance(mask,np.ndarray) or not np.any(mask):
+            messagebox.showinfo(APP_TITLE,"먼저 다듬을 영역을 선택해주세요."); return
+        m=mask.astype(np.uint8).copy()
+        expand=int(round(float(self.refine_expand_var.get())))
+        if expand:
+            k=2*abs(expand)+1
+            kernel=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(k,k))
+            m=cv2.dilate(m,kernel,iterations=1) if expand>0 else cv2.erode(m,kernel,iterations=1)
+        feather=float(self.refine_feather_var.get())
+        if feather>0:
+            # grayscale alpha mask gives a genuinely soft edge when a new layer is created
+            m=cv2.GaussianBlur(m,(0,0),max(.35,feather/2.0))
+        self.object_mask=m; self.selection_mask=m.copy(); self.object_edit_mask=m.copy()
+        self.refresh_object_canvas()
+        self.object_select_status.config(text=f"경계 다듬기 적용 · 부드럽게 {feather:.0f}px · 확장/축소 {expand:+d}px")
+
+    def activate_auto_select_mode(self):
+        if self.object_result is None:
+            messagebox.showwarning(APP_TITLE,"먼저 사진을 열어주세요."); return "break"
+        self.clone_source_mode=False
+        self._set_remove_tool_bindings("auto_select")
+        self.object_select_status.config(text="자동 객체 선택 · 선택하려는 물체의 안쪽을 클릭하세요. A")
+        return "break"
+
+    def auto_select_at(self, event):
+        """Offline click-to-select using GrabCut with a click-centered foreground seed."""
+        img=self.object_result
+        if img is None: return
+        x,y=self._canvas_to_image(event.x,event.y)
+        h,w=img.shape[:2]
+        if not (0<=x<w and 0<=y<h): return
+        # Work at reduced resolution for responsiveness on large photos.
+        maxdim=1100
+        sc=min(1.0,maxdim/max(h,w))
+        if sc<1:
+            small=cv2.resize(img,(max(1,int(w*sc)),max(1,int(h*sc))),interpolation=cv2.INTER_AREA)
+        else: small=img
+        sh,sw=small.shape[:2]; sx=int(x*sc); sy=int(y*sc)
+        gc=np.full((sh,sw),cv2.GC_PR_BGD,np.uint8)
+        # border is definite background
+        border=max(2,int(min(sh,sw)*.015)); gc[:border,:]=0; gc[-border:,:]=0; gc[:,:border]=0; gc[:,-border:]=0
+        # local color similarity provides probable foreground around the click
+        lab=cv2.cvtColor(small,cv2.COLOR_BGR2LAB).astype(np.float32)
+        seed=lab[sy,sx]
+        dist=np.linalg.norm(lab-seed,axis=2)
+        local=(dist < 34).astype(np.uint8)
+        # retain only the connected similar-color component containing the click
+        n,labels,stats,_=cv2.connectedComponentsWithStats(local,8)
+        lbl=labels[sy,sx]
+        if lbl>0: gc[labels==lbl]=cv2.GC_PR_FGD
+        rr=max(3,int(min(sh,sw)*.012)); cv2.circle(gc,(sx,sy),rr,cv2.GC_FGD,-1)
+        bg=np.zeros((1,65),np.float64); fg=np.zeros((1,65),np.float64)
+        try:
+            cv2.grabCut(small,gc,None,bg,fg,4,cv2.GC_INIT_WITH_MASK)
+            sel=np.where((gc==cv2.GC_FGD)|(gc==cv2.GC_PR_FGD),255,0).astype(np.uint8)
+            # keep only connected component containing clicked point when possible
+            n,labels,stats,_=cv2.connectedComponentsWithStats((sel>0).astype(np.uint8),8)
+            lbl=labels[sy,sx]
+            if lbl>0: sel=np.where(labels==lbl,255,0).astype(np.uint8)
+        except cv2.error:
+            sel=(local*255).astype(np.uint8)
+        if sc<1: sel=cv2.resize(sel,(w,h),interpolation=cv2.INTER_NEAREST)
+        # small close/open removes isolated speckles while keeping the object shape
+        ker=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3)); sel=cv2.morphologyEx(sel,cv2.MORPH_CLOSE,ker,iterations=1)
+        self.object_mask=sel; self.selection_mask=sel.copy(); self.object_edit_mask=sel.copy()
+        self.refresh_object_canvas(); self.object_select_status.config(text="자동 객체 선택 완료 · 필요하면 브러시/지우개 또는 경계 다듬기로 보정하세요.")
 
     def toggle_active_layer_visibility(self):
         if self.active_layer_index is None or not (0 <= self.active_layer_index < len(self.object_layers)):
@@ -1007,8 +1153,8 @@ class PhotoColorMatcherApp(tk.Tk):
         layer = {
             "name": f"객체 {len(self.object_layers)+1}",
             "pixels": source,
-            "mask": (mask > 0).astype(np.uint8) * 255,
-            "dx": 0, "dy": 0, "scale": 1.0, "visible": True
+            "mask": mask.astype(np.uint8).copy(),
+            "dx": 0, "dy": 0, "scale": 1.0, "opacity": 1.0, "visible": True
         }
         self.object_layers.append(layer)
         self.active_layer_index = len(self.object_layers)-1
@@ -2015,6 +2161,10 @@ class PhotoColorMatcherApp(tk.Tk):
                 )
                 self.activate_brush_mode()
                 self.refresh_object_canvas()
+            return "break"
+
+        if tool == "auto_select":
+            self.auto_select_at(event)
             return "break"
 
         if tool == "move":
