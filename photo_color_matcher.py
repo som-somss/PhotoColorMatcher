@@ -13,13 +13,13 @@ APP_TITLE = "Photo Color Matcher Pro"
 SUPPORTED = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
-def make_toolbar_icon(kind, size=30, fg="#f7f9fb"):
+def make_toolbar_icon(kind, size=34, fg="#f7f9fb"):
     """Render crisp Photoshop-style monochrome icons using 4x supersampling.
 
     The icon is drawn at high resolution and reduced with LANCZOS, so the EXE
     stays self-contained while curves/diagonals remain smooth on Windows.
     """
-    S = 4
+    S = 8
     N = size * S
     im = Image.new("RGBA", (N, N), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
@@ -54,7 +54,10 @@ def make_toolbar_icon(kind, size=30, fg="#f7f9fb"):
               ((5,5),(5,11)),((5,15),(5,23)),((23,5),(23,11)),((23,15),(23,23))]
         for a,b in segs: line([a,b],width=max(4,w-1))
     elif kind == "ellipse":
-        d.ellipse(box(4,6,25,23), outline=c, width=w)
+        # Photoshop-style marching ants ellipse
+        bb = box(4, 6, 25, 23)
+        for a in range(0, 360, 28):
+            d.arc(bb, start=a, end=min(a + 15, 359), fill=c, width=w)
     elif kind == "lasso":
         # freehand lasso + tail
         d.ellipse(box(4,5,24,20), outline=c, width=w)
@@ -91,12 +94,22 @@ def make_toolbar_icon(kind, size=30, fg="#f7f9fb"):
     elif kind == "clone":
         ellipse(11,4,19,12,fill=c); rect(8,11,22,17,fill=c,r=1)
         rect(5,17,25,25,width=w,r=2)
+    elif kind == "compare":
+        # split-frame before/after comparison icon
+        rect(4.5,5,25.5,24.5,width=w,r=1.6)
+        line([(15,6.5),(15,23)], width=max(3,w-2))
+        poly([(7.5,19),(11.2,14.8),(14.2,18.2),(14.2,22),(7.5,22)])
+        d.ellipse(box(9,9,12.5,12.5), fill=c)
+        poly([(16.5,20.5),(20,16.5),(24,20.5),(24,23),(16.5,23)])
     elif kind == "undo":
-        d.arc(box(6,6,25,25), P(65), P(300), fill=c, width=w)
-        poly([(5,8),(12,4.5),(10.5,12.5)])
+        # clean counter-clockwise history arrow
+        d.arc(box(6,6,25,25), P(48), P(302), fill=c, width=w)
+        poly([(4.2,8.2),(12.1,4.2),(10.6,13.1)])
     elif kind == "reset":
-        d.arc(box(5,5,25,25), P(20), P(330), fill=c, width=w)
-        poly([(20,3.8),(25.5,8),(19,10.5)])
+        # full restore arrow, visually distinct from undo
+        d.arc(box(5,5,25,25), P(15), P(338), fill=c, width=w)
+        poly([(19.4,3.4),(26.2,7.9),(19.1,11.1)])
+        d.ellipse(box(13.2,13.2,16.8,16.8), fill=c)
     elif kind == "clear":
         line([(7,7),(23,23)],width=w+2); line([(23,7),(7,23)],width=w+2)
     else:
@@ -344,6 +357,8 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_zoom = 1.0
         self.object_zoom_center = None
         self.object_history = []
+        self.object_compare_original = False
+        self._last_brush_point = None
         self.brush_size = tk.DoubleVar(value=35)
         self.inpaint_radius = tk.DoubleVar(value=5)
         self.remove_strength = tk.DoubleVar(value=70)
@@ -480,9 +495,9 @@ class PhotoColorMatcherApp(tk.Tk):
         self._tool_buttons = {}
 
         def add_icon(kind, tip, command, tool_key=None, gap=2):
-            img = ImageTk.PhotoImage(make_toolbar_icon(kind, 30))
+            img = ImageTk.PhotoImage(make_toolbar_icon(kind, 34))
             self._toolbar_images[tip] = img
-            b = tk.Button(bar, image=img, command=command, width=40, height=40,
+            b = tk.Button(bar, image=img, command=command, width=46, height=46,
                           bg="#343b42", activebackground="#2387f3", relief="flat", bd=0,
                           highlightthickness=1, highlightbackground="#4a535c", cursor="hand2")
             b.pack(side="left", padx=gap)
@@ -504,6 +519,7 @@ class PhotoColorMatcherApp(tk.Tk):
         add_icon("eyedrop", "질감 원본 선택 · Ctrl+D", self.activate_clone_source_mode, "clone_source")
         add_icon("clear", "질감 선택 해제", self.clear_clone_source)
         tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
+        add_icon("compare", "원본/결과 비교", self.toggle_object_compare, "compare")
         add_icon("undo", "실행 취소", self.undo_object_removal)
         add_icon("reset", "원본 복원", self.restore_object_original)
         save_btn = add_icon("save", "결과 저장", self.save_object_result)
@@ -558,6 +574,7 @@ class PhotoColorMatcherApp(tk.Tk):
             self.object_image_path = p
             self.object_bgr = bgr
             self.object_result = bgr.copy()
+            self.object_compare_original = False
             self.object_mask = np.zeros(bgr.shape[:2], dtype=np.uint8)
             self.object_history = []
             self.clone_source_mode = False
@@ -625,7 +642,7 @@ class PhotoColorMatcherApp(tk.Tk):
         buttons = getattr(self, "_tool_buttons", {})
         active = getattr(self, "active_remove_tool", "brush")
         for key, btn in buttons.items():
-            selected = (key == active)
+            selected = (key == active) or (key == "compare" and getattr(self, "object_compare_original", False))
             try:
                 btn.configure(bg="#2387f3" if selected else "#343b42",
                               activebackground="#2387f3",
@@ -768,7 +785,8 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_canvas.update_idletasks()
         cw = max(100, self.object_canvas.winfo_width())
         ch = max(100, self.object_canvas.winfo_height())
-        h, w = self.object_result.shape[:2]
+        display_bgr = self.object_bgr if (getattr(self, "object_compare_original", False) and self.object_bgr is not None) else self.object_result
+        h, w = display_bgr.shape[:2]
         fit_scale = min(cw / w, ch / h, 1.0)
         scale = fit_scale * self.object_zoom
         dw, dh = max(1, int(w * scale)), max(1, int(h * scale))
@@ -793,10 +811,10 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_display_scale = scale
         self.object_display_offset = (ox, oy)
 
-        rgb = cv2.cvtColor(self.object_result, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
         disp = cv2.resize(rgb, (dw, dh), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
 
-        if self.object_mask is not None and np.any(self.object_mask):
+        if (not getattr(self, "object_compare_original", False)) and self.object_mask is not None and np.any(self.object_mask):
             m = cv2.resize(self.object_mask, (dw, dh), interpolation=cv2.INTER_NEAREST) > 0
             overlay = disp.copy()
             overlay[m] = [255, 55, 55]
@@ -1044,8 +1062,10 @@ class PhotoColorMatcherApp(tk.Tk):
             return "break"
 
         if tool == "brush":
+            self._last_brush_point = None
             self.paint_object_mask(event)
         elif tool == "eraser":
+            self._last_brush_point = None
             self.erase_object_mask(event)
         return "break"
 
@@ -1062,6 +1082,7 @@ class PhotoColorMatcherApp(tk.Tk):
     def object_canvas_release(self, event):
         if self.active_remove_tool in ("rect", "ellipse"):
             self.shape_select_end(event)
+        self._last_brush_point = None
         return "break"
 
     def show_brush_preview(self, event):
@@ -1103,7 +1124,11 @@ class PhotoColorMatcherApp(tk.Tk):
         h, w = self.object_mask.shape
         if 0 <= x < w and 0 <= y < h:
             radius = max(1, int(self.brush_size.get() / max(scale, 1e-6) / 2))
-            cv2.circle(self.object_mask, (x, y), radius, 255, -1)
+            prev = getattr(self, "_last_brush_point", None)
+            if prev is not None:
+                cv2.line(self.object_mask, prev, (x, y), 255, radius * 2, cv2.LINE_AA)
+            cv2.circle(self.object_mask, (x, y), radius, 255, -1, cv2.LINE_AA)
+            self._last_brush_point = (x, y)
             self.refresh_object_canvas()
             self.show_brush_preview(event)
 
@@ -1118,11 +1143,17 @@ class PhotoColorMatcherApp(tk.Tk):
         h, w = self.object_mask.shape
         if 0 <= x < w and 0 <= y < h:
             radius = max(1, int(self.brush_size.get() / scale / 2))
-            cv2.circle(self.object_mask, (x, y), radius, 0, -1)
+            prev = getattr(self, "_last_brush_point", None)
+            if prev is not None:
+                cv2.line(self.object_mask, prev, (x, y), 0, radius * 2, cv2.LINE_AA)
+            cv2.circle(self.object_mask, (x, y), radius, 0, -1, cv2.LINE_AA)
+            self._last_brush_point = (x, y)
             if isinstance(self.object_edit_mask, np.ndarray) and self.object_edit_mask.shape == self.object_mask.shape:
-                cv2.circle(self.object_edit_mask, (x, y), radius, 0, -1)
+                if prev is not None: cv2.line(self.object_edit_mask, prev, (x, y), 0, radius * 2, cv2.LINE_AA)
+                cv2.circle(self.object_edit_mask, (x, y), radius, 0, -1, cv2.LINE_AA)
             if hasattr(self, "selection_mask") and isinstance(self.selection_mask, np.ndarray) and self.selection_mask.shape == self.object_mask.shape:
-                cv2.circle(self.selection_mask, (x, y), radius, 0, -1)
+                if prev is not None: cv2.line(self.selection_mask, prev, (x, y), 0, radius * 2, cv2.LINE_AA)
+                cv2.circle(self.selection_mask, (x, y), radius, 0, -1, cv2.LINE_AA)
             self.refresh_object_canvas()
             self.show_brush_preview(event)
 
@@ -1163,6 +1194,23 @@ class PhotoColorMatcherApp(tk.Tk):
 
         self.object_mask[:] = 0
         self.object_edit_mask = None
+        self.refresh_object_canvas()
+
+    def toggle_object_compare(self):
+        """Toggle the canvas between untouched original and current edited result."""
+        if self.object_bgr is None or self.object_result is None:
+            messagebox.showwarning(APP_TITLE, "먼저 사진을 열어주세요.")
+            return
+        self.object_compare_original = not getattr(self, "object_compare_original", False)
+        btn = getattr(self, "_tool_buttons", {}).get("compare")
+        if btn is not None:
+            try:
+                btn.configure(bg="#2387f3" if self.object_compare_original else "#343b42",
+                              highlightbackground="#66b3ff" if self.object_compare_original else "#4a535c")
+            except Exception:
+                pass
+        if hasattr(self, "object_select_status"):
+            self.object_select_status.config(text="원본 보기" if self.object_compare_original else "편집 결과 보기")
         self.refresh_object_canvas()
 
     def undo_object_removal(self):
