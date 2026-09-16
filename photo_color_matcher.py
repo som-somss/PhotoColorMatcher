@@ -1135,11 +1135,26 @@ class PhotoColorMatcherApp(tk.Tk):
         return "break"
 
     def clear_clone_source(self):
+        """Clear clone-source state and leave clone/brush mode completely."""
         self.clone_source_mode = False
         self.clone_source_point = None
+        self._last_brush_point = None
+        self.hide_brush_preview()
+        # Do not fall back to Brush.  A neutral tool prevents the brush cursor
+        # and accidental mask painting immediately after '질감 선택 해제'.
+        self._set_remove_tool_bindings("none")
         if hasattr(self, "clone_status_label"):
-            self.clone_status_label.config(text="자동 복원 모드 · Ctrl+D → 사진의 질감 원본 클릭 시 복제 모드")
+            self.clone_status_label.config(text="질감 선택 해제됨 · Ctrl+D로 새 질감 원본을 선택할 수 있습니다.")
+        try:
+            self.object_canvas.configure(cursor="arrow")
+        except Exception:
+            pass
+        try:
+            self.status_var.set("질감 선택이 해제되었습니다.")
+        except Exception:
+            pass
         self.refresh_object_canvas()
+        return "break"
 
     def activate_object_select(self):
         self.clone_source_mode = False
@@ -1521,33 +1536,54 @@ class PhotoColorMatcherApp(tk.Tk):
                 cv2.line(self.object_mask, prev, (x, y), 255, radius * 2, cv2.LINE_AA)
             cv2.circle(self.object_mask, (x, y), radius, 255, -1, cv2.LINE_AA)
             self._last_brush_point = (x, y)
+            # Keep every legacy mask reference synchronized with the visible mask.
+            # Several editing commands still read selection_mask/object_edit_mask.
+            self.selection_mask = self.object_mask.copy()
+            self.object_edit_mask = self.object_mask.copy()
             self.refresh_object_canvas()
             self.show_brush_preview(event)
 
     def erase_object_mask(self, event):
-        """Erase from the current selection mask using the same adjustable brush size."""
-        if self.object_result is None or self.object_mask is None:
+        """Erase the visible selection/brush marking only; never alter image pixels."""
+        if self.object_result is None:
             return
+
+        # Recover the canonical visible mask even when an older selection tool
+        # populated only selection_mask/object_edit_mask.
+        base = None
+        for candidate in (getattr(self, "object_mask", None),
+                          getattr(self, "selection_mask", None),
+                          getattr(self, "object_edit_mask", None)):
+            if isinstance(candidate, np.ndarray) and candidate.shape[:2] == self.object_result.shape[:2]:
+                if base is None:
+                    base = candidate.copy()
+                else:
+                    base = cv2.bitwise_or(base, candidate)
+        if base is None:
+            base = np.zeros(self.object_result.shape[:2], dtype=np.uint8)
+        self.object_mask = base
+
         scale = max(self.object_display_scale, 1e-6)
         ox, oy = self.object_display_offset
         x = int((event.x - ox) / scale)
         y = int((event.y - oy) / scale)
         h, w = self.object_mask.shape
-        if 0 <= x < w and 0 <= y < h:
-            radius = max(1, int(self.brush_size.get() / scale / 2))
-            prev = getattr(self, "_last_brush_point", None)
-            if prev is not None:
-                cv2.line(self.object_mask, prev, (x, y), 0, radius * 2, cv2.LINE_AA)
-            cv2.circle(self.object_mask, (x, y), radius, 0, -1, cv2.LINE_AA)
-            self._last_brush_point = (x, y)
-            if isinstance(self.object_edit_mask, np.ndarray) and self.object_edit_mask.shape == self.object_mask.shape:
-                if prev is not None: cv2.line(self.object_edit_mask, prev, (x, y), 0, radius * 2, cv2.LINE_AA)
-                cv2.circle(self.object_edit_mask, (x, y), radius, 0, -1, cv2.LINE_AA)
-            if hasattr(self, "selection_mask") and isinstance(self.selection_mask, np.ndarray) and self.selection_mask.shape == self.object_mask.shape:
-                if prev is not None: cv2.line(self.selection_mask, prev, (x, y), 0, radius * 2, cv2.LINE_AA)
-                cv2.circle(self.selection_mask, (x, y), radius, 0, -1, cv2.LINE_AA)
-            self.refresh_object_canvas()
-            self.show_brush_preview(event)
+        if not (0 <= x < w and 0 <= y < h):
+            return
+
+        radius = max(1, int(self.brush_size.get() / scale / 2))
+        prev = getattr(self, "_last_brush_point", None)
+        if prev is not None:
+            cv2.line(self.object_mask, prev, (x, y), 0, radius * 2, cv2.LINE_AA)
+        cv2.circle(self.object_mask, (x, y), radius, 0, -1, cv2.LINE_AA)
+        self._last_brush_point = (x, y)
+
+        # One source of truth: all selection/edit commands now see exactly the
+        # same mask, so no stale green outline can remain after erasing.
+        self.selection_mask = self.object_mask.copy()
+        self.object_edit_mask = self.object_mask.copy()
+        self.refresh_object_canvas()
+        self.show_brush_preview(event)
 
     def clear_object_mask(self):
         if self.object_mask is not None:
