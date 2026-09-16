@@ -74,6 +74,13 @@ def make_toolbar_icon(kind, size=34, fg="#f7f9fb"):
         line([(14,18.5),(11.5,24),(16.5,21.5)],width=max(4,w-1))
         d.ellipse(box(17,16,28,27), fill="#343b42", outline=c, width=max(3,w-2))
         line([(19.5,21.5),(25.5,21.5)], width=max(4,w-1))
+    elif kind == "deselect":
+        # Deselect all: dashed selection box with a clean diagonal slash.
+        dash_w=max(3,round(size*0.052*S))
+        segs=[((5,5),(10.5,5)),((14.5,5),(23,5)),((5,23),(10.5,23)),((14.5,23),(23,23)),
+              ((5,5),(5,10.5)),((5,14.5),(5,23)),((23,5),(23,10.5)),((23,14.5),(23,23))]
+        for a,b in segs: line([a,b],width=dash_w)
+        line([(6.5,23.5),(23.5,6.5)], width=max(4,w))
     elif kind == "brush":
         # Filled painter's brush with a tapered bristle tip.
         poly([(6.0,25.0),(8.2,19.0),(11.2,17.0),(14.2,18.7),(14.0,21.7),(11.0,24.4)])
@@ -449,8 +456,35 @@ class PhotoColorMatcherApp(tk.Tk):
         self.bind_all("<Control-s>", self._ctrl_save)
         self.bind_all("<Control-S>", self._ctrl_save)
 
-        self.bind_all("<Control-d>", self.activate_clone_source_mode)
-        self.bind_all("<Control-D>", self.activate_clone_source_mode)
+        # Photoshop-like selection/source shortcuts.
+        self.bind_all("<Control-d>", self.clear_all_selection)
+        self.bind_all("<Control-D>", self.clear_all_selection)
+        self.bind_all("<Control-Shift-d>", self.activate_clone_source_mode)
+        self.bind_all("<Control-Shift-D>", self.activate_clone_source_mode)
+        # Editing shortcuts
+        self.bind_all("<Control-z>", lambda e: (self.undo_object_removal(), "break")[1])
+        self.bind_all("<Control-Z>", lambda e: (self.undo_object_removal(), "break")[1])
+        self.bind_all("<Key-b>", lambda e: self.activate_brush_mode())
+        self.bind_all("<Key-B>", lambda e: self.activate_brush_mode())
+        self.bind_all("<Key-e>", lambda e: self.activate_mask_eraser_mode())
+        self.bind_all("<Key-E>", lambda e: self.activate_mask_eraser_mode())
+        self.bind_all("<Key-r>", lambda e: self.set_selection_tool("rect"))
+        self.bind_all("<Key-R>", lambda e: self.set_selection_tool("rect"))
+        self.bind_all("<Key-o>", lambda e: self.set_selection_tool("ellipse"))
+        self.bind_all("<Key-O>", lambda e: self.set_selection_tool("ellipse"))
+        self.bind_all("<Key-l>", lambda e: self.set_selection_tool("free"))
+        self.bind_all("<Key-L>", lambda e: self.set_selection_tool("free"))
+        self.bind_all("<Key-x>", lambda e: self.activate_selection_subtract_mode())
+        self.bind_all("<Key-X>", lambda e: self.activate_selection_subtract_mode())
+        self.bind_all("<Key-m>", lambda e: self.activate_move_mode())
+        self.bind_all("<Key-M>", lambda e: self.activate_move_mode())
+        self.bind_all("<Key-u>", lambda e: self.activate_blur_brush_mode())
+        self.bind_all("<Key-U>", lambda e: self.activate_blur_brush_mode())
+        self.bind_all("<Key-c>", lambda e: self.toggle_object_compare())
+        self.bind_all("<Key-C>", lambda e: self.toggle_object_compare())
+        self.bind_all("<Delete>", lambda e: self.delete_selection_to_white())
+        self.bind_all("<Key-q>", lambda e: self.clear_clone_source())
+        self.bind_all("<Key-Q>", lambda e: self.clear_clone_source())
 
     def _build_ui(self):
         notebook = ttk.Notebook(self)
@@ -567,24 +601,25 @@ class PhotoColorMatcherApp(tk.Tk):
             return b
 
         add_icon("open", "사진 열기", self.open_object_image)
-        add_icon("move", "선택 영역 잘라서 이동", self.activate_move_mode, "move")
+        add_icon("move", "선택 영역 잘라서 이동 · M", self.activate_move_mode, "move")
         tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
-        add_icon("rect", "사각형 선택", lambda: self.set_selection_tool("rect"), "rect")
-        add_icon("ellipse", "타원형 선택", lambda: self.set_selection_tool("ellipse"), "ellipse")
-        add_icon("lasso", "직접 선택", lambda: self.set_selection_tool("free"), "free")
-        add_icon("brush", "브러시 · 마스크 추가", self.activate_brush_mode, "brush")
-        add_icon("eraser", "브러시 마킹 지우기", self.activate_mask_eraser_mode, "eraser")
-        add_icon("subtract_lasso", "직접 선택하여 선택영역 해제", self.activate_selection_subtract_mode, "free_subtract")
+        add_icon("rect", "사각형 선택 · R", lambda: self.set_selection_tool("rect"), "rect")
+        add_icon("ellipse", "타원형 선택 · O", lambda: self.set_selection_tool("ellipse"), "ellipse")
+        add_icon("lasso", "직접 선택 · L", lambda: self.set_selection_tool("free"), "free")
+        add_icon("brush", "브러시 · 마스크 추가 · B", self.activate_brush_mode, "brush")
+        add_icon("eraser", "브러시 마킹 지우기 · E", self.activate_mask_eraser_mode, "eraser")
+        add_icon("subtract_lasso", "선택영역 일부 해제 · X", self.activate_selection_subtract_mode, "free_subtract")
+        add_icon("deselect", "선택영역 전체 해제 · Ctrl+D", self.clear_all_selection)
         tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
         add_icon("color", "선택 색상 변경", self.apply_object_color)
-        add_icon("blur", "브러시 블러", self.activate_blur_brush_mode, "blur_brush")
-        add_icon("cut_delete", "선택 영역 완전 삭제 · 흰색 처리", self.delete_selection_to_white)
+        add_icon("blur", "브러시 블러 · U", self.activate_blur_brush_mode, "blur_brush")
+        add_icon("cut_delete", "선택 영역 완전 삭제 · Delete", self.delete_selection_to_white)
         add_icon("remove", "선택 영역 삭제 · 주변 배경 복원", self.run_object_removal)
-        add_icon("eyedrop", "질감 원본 선택 · Ctrl+D", self.activate_clone_source_mode, "clone_source")
-        add_icon("clear", "질감 선택 해제", self.clear_clone_source)
+        add_icon("eyedrop", "질감 원본 선택 · Ctrl+Shift+D", self.activate_clone_source_mode, "clone_source")
+        add_icon("clear", "질감 선택 해제 · Q", self.clear_clone_source)
         tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
-        add_icon("compare", "원본/결과 비교", self.toggle_object_compare, "compare")
-        add_icon("undo", "실행 취소", self.undo_object_removal)
+        add_icon("compare", "원본/결과 비교 · C", self.toggle_object_compare, "compare")
+        add_icon("undo", "실행 취소 · Ctrl+Z", self.undo_object_removal)
         add_icon("reset", "원본 복원", self.restore_object_original)
         save_btn = add_icon("save", "결과 저장", self.save_object_result)
         save_btn.pack_configure(side="right")
@@ -608,7 +643,7 @@ class PhotoColorMatcherApp(tk.Tk):
         self.blur_strength.trace_add("write", lambda *_: self.blur_strength_label.config(text=str(int(self.blur_strength.get()))))
         self.clone_status_label = ttk.Label(
             opts,
-            text="자동 복원 모드 · Ctrl+D → 사진의 질감 원본 클릭 시 복제 모드",
+            text="자동 복원 모드 · Ctrl+Shift+D → 사진의 질감 원본 클릭 시 복제 모드",
         )
         self.clone_status_label.pack(side="left", padx=12)
 
@@ -654,8 +689,6 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_canvas.bind("<B1-Motion>", self.object_canvas_drag)
         self.object_canvas.bind("<ButtonRelease-1>", self.object_canvas_release)
         self.object_canvas.bind("<Double-Button-1>", lambda e: self.finish_manual_selection() if self.active_remove_tool in ("free", "free_subtract") else None)
-        self.bind_all("<Control-d>", self.activate_clone_source_mode)
-        self.bind_all("<Control-D>", self.activate_clone_source_mode)
         self.object_canvas.bind("<Motion>", self.show_brush_preview)
         self.object_canvas.bind("<Leave>", self.hide_brush_preview)
         self.object_canvas.bind("<Control-MouseWheel>", self.object_canvas_zoom)
@@ -686,7 +719,7 @@ class PhotoColorMatcherApp(tk.Tk):
             self.object_select_start = None
             self.object_edit_mask = None
             if hasattr(self, "clone_status_label"):
-                self.clone_status_label.config(text="자동 복원 모드 · Ctrl+D → 사진의 질감 원본 클릭 시 복제 모드")
+                self.clone_status_label.config(text="자동 복원 모드 · Ctrl+Shift+D → 사진의 질감 원본 클릭 시 복제 모드")
             self.refresh_object_canvas()
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"사진을 열 수 없습니다.\n{e}")
@@ -1344,6 +1377,41 @@ class PhotoColorMatcherApp(tk.Tk):
             self.object_canvas.create_line(cx-r-5, cy, cx+r+5, cy, fill="#00e5ff", width=2)
             self.object_canvas.create_line(cx, cy-r-5, cx, cy+r+5, fill="#00e5ff", width=2)
 
+    def clear_all_selection(self, event=None):
+        """Clear the entire current selection/mask without altering image pixels."""
+        self.clone_source_mode = False
+        self.object_select_mode = False
+        self.object_select_points = []
+        for name in ("manual_points", "polygon_points"):
+            if hasattr(self, name):
+                setattr(self, name, [])
+        # Clear every mask representation used by the editing tools so no stale
+        # red overlay can reappear after switching tools.
+        shape = self.object_result.shape[:2] if isinstance(getattr(self, "object_result", None), np.ndarray) else None
+        for name in ("object_mask", "selection_mask", "object_edit_mask"):
+            value = getattr(self, name, None)
+            if isinstance(value, np.ndarray):
+                setattr(self, name, np.zeros_like(value))
+            elif shape is not None:
+                setattr(self, name, np.zeros(shape, dtype=np.uint8))
+            else:
+                setattr(self, name, None)
+        self._last_brush_point = None
+        self.hide_brush_preview()
+        self._set_remove_tool_bindings("none")
+        try:
+            self.object_canvas.configure(cursor="arrow")
+        except Exception:
+            pass
+        if hasattr(self, "object_select_status"):
+            self.object_select_status.config(text="선택영역 전체 해제됨 · Ctrl+D")
+        try:
+            self.status_var.set("선택영역을 모두 해제했습니다.")
+        except Exception:
+            pass
+        self.refresh_object_canvas()
+        return "break"
+
     def activate_clone_source_mode(self, event=None):
         self.clone_source_mode = True
         self._set_remove_tool_bindings("clone_source")
@@ -1361,7 +1429,7 @@ class PhotoColorMatcherApp(tk.Tk):
         # and accidental mask painting immediately after '질감 선택 해제'.
         self._set_remove_tool_bindings("none")
         if hasattr(self, "clone_status_label"):
-            self.clone_status_label.config(text="질감 선택 해제됨 · Ctrl+D로 새 질감 원본을 선택할 수 있습니다.")
+            self.clone_status_label.config(text="질감 선택 해제됨 · Ctrl+Shift+D로 새 질감 원본을 선택할 수 있습니다.")
         try:
             self.object_canvas.configure(cursor="arrow")
         except Exception:
@@ -1769,56 +1837,54 @@ class PhotoColorMatcherApp(tk.Tk):
             self.show_brush_preview(event)
 
     def erase_object_mask(self, event):
-        """Subtract the eraser stroke from every live selection mask.
+        """Erase the visible red selection/mask reliably.
 
-        Important: do NOT merge/OR legacy masks before erasing.  A stale copy can
-        otherwise restore pixels that were erased on the previous mouse event.
+        A temporary eraser stroke mask is created in image coordinates and is
+        subtracted from ONE canonical mask. Legacy mask aliases are then copied
+        from that result. This avoids stale masks re-creating erased pixels.
         """
         if self.object_result is None:
             return "break"
 
-        scale = max(float(self.object_display_scale), 1e-6)
-        ox, oy = self.object_display_offset
+        h, w = self.object_result.shape[:2]
+        scale = max(float(getattr(self, "object_display_scale", 1.0)), 1e-6)
+        ox, oy = getattr(self, "object_display_offset", (0, 0))
         x = int(round((event.x - ox) / scale))
         y = int(round((event.y - oy) / scale))
-        h, w = self.object_result.shape[:2]
         if not (0 <= x < w and 0 <= y < h):
             return "break"
 
-        # brush_size is the on-screen diameter. Convert it to image pixels.
-        radius = max(1, int(round(float(self.brush_size.get()) / scale / 2.0)))
-        prev = getattr(self, "_last_brush_point", None)
-
-        # Erase IN PLACE from every mask that may be used by legacy commands.
-        # This prevents an old mask copy from resurrecting the erased marking.
-        valid_masks = []
-        for name in ("object_mask", "selection_mask", "object_edit_mask"):
-            m = getattr(self, name, None)
-            if isinstance(m, np.ndarray) and m.shape[:2] == (h, w):
-                valid_masks.append(m)
-
-        if not valid_masks:
-            self.object_mask = np.zeros((h, w), dtype=np.uint8)
-            self.selection_mask = self.object_mask.copy()
-            self.object_edit_mask = self.object_mask.copy()
-            valid_masks = [self.object_mask, self.selection_mask, self.object_edit_mask]
-
-        for m in valid_masks:
-            if prev is not None:
-                cv2.line(m, prev, (x, y), 0, radius * 2, cv2.LINE_8)
-            cv2.circle(m, (x, y), radius, 0, -1, cv2.LINE_8)
-
-        # Canonicalize all references AFTER subtraction only.
+        # Recover the currently VISIBLE selection as the canonical source.
         canonical = getattr(self, "object_mask", None)
-        if not (isinstance(canonical, np.ndarray) and canonical.shape[:2] == (h, w)):
-            canonical = valid_masks[0]
-            self.object_mask = canonical.copy()
-        self.selection_mask = self.object_mask.copy()
-        self.object_edit_mask = self.object_mask.copy()
+        if not (isinstance(canonical, np.ndarray) and canonical.shape == (h, w)):
+            canonical = getattr(self, "selection_mask", None)
+        if not (isinstance(canonical, np.ndarray) and canonical.shape == (h, w)):
+            canonical = getattr(self, "object_edit_mask", None)
+        if not (isinstance(canonical, np.ndarray) and canonical.shape == (h, w)):
+            canonical = np.zeros((h, w), dtype=np.uint8)
+        else:
+            canonical = canonical.copy()
 
+        radius = max(1, int(round(float(self.brush_size.get()) / scale / 2.0)))
+        stroke = np.zeros((h, w), dtype=np.uint8)
+        prev = getattr(self, "_last_brush_point", None)
+        if prev is not None:
+            cv2.line(stroke, prev, (x, y), 255, max(2, radius * 2), cv2.LINE_AA)
+        cv2.circle(stroke, (x, y), radius, 255, -1, cv2.LINE_AA)
+
+        # Hard subtraction: every touched pixel is removed from the selection.
+        canonical[stroke > 0] = 0
+        self.object_mask = canonical
+        self.selection_mask = canonical.copy()
+        self.object_edit_mask = canonical.copy()
         self._last_brush_point = (x, y)
+
         self.refresh_object_canvas()
         self.show_brush_preview(event)
+        try:
+            self.status_var.set("브러시 마킹 지우기: 드래그한 부분의 선택 마스크를 지웠습니다.")
+        except Exception:
+            pass
         return "break"
 
     def clear_object_mask(self):
