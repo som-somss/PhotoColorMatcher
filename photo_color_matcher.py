@@ -1422,6 +1422,17 @@ class PhotoColorMatcherApp(tk.Tk):
                 contours, _ = cv2.findContours((em > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(disp, contours, -1, (60, 255, 80), 2)
 
+        # Liquify freeze/protection mask is independent from the normal red selection mask.
+        # Show it in translucent cyan while Freeze/Unfreeze is active so the protected
+        # pixels remain visible without hiding the underlying texture.
+        if (not getattr(self, "object_compare_original", False) and
+            self.active_remove_tool in ("freeze", "unfreeze") and
+            isinstance(self.freeze_mask, np.ndarray) and np.any(self.freeze_mask)):
+            fm_disp = cv2.resize(self.freeze_mask, (dw, dh), interpolation=cv2.INTER_NEAREST) > 0
+            tint = disp.copy()
+            tint[fm_disp] = [70, 205, 255]
+            disp = np.where(fm_disp[..., None], (0.34*tint + 0.66*disp).astype(np.uint8), disp)
+
         # Object-layer selection is shown only as a thin outline, never as a red overlay.
         # Hide the guide while painting effects so the real texture stays unobstructed.
         if (not getattr(self, "object_compare_original", False) and
@@ -1781,9 +1792,20 @@ class PhotoColorMatcherApp(tk.Tk):
             # soften protection edge to prevent tearing
             protect=cv2.GaussianBlur((fm>0).astype(np.float32),(0,0),max(1.,r*.12)); fall*=1-np.clip(protect,0,1)
         mx=np.tile(np.arange(w,dtype=np.float32),(h,1))-fall*(dx*st); my=np.tile(np.arange(h,dtype=np.float32)[:,None],(1,w))-fall*(dy*st)
+        # Keep an untouched copy.  Merely setting displacement to zero in the
+        # protected area is not enough when an object alpha mask is also warped;
+        # explicitly restore protected pixels/mask after remapping.
+        src_img = img.copy()
+        src_valid = None if valid is None else valid.copy()
         warped=cv2.remap(img,mx,my,cv2.INTER_CUBIC,borderMode=cv2.BORDER_REFLECT)
         if valid is not None:
             valid=cv2.remap(valid,mx,my,cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT); warped[valid==0]=0
+        if fm is not None and np.any(fm):
+            hard_protect = fm > 0
+            warped[hard_protect] = src_img[hard_protect]
+            if valid is not None and src_valid is not None:
+                valid[hard_protect] = src_valid[hard_protect]
+                warped[valid == 0] = 0
         self._commit_active_layer_edit(warped,valid,layer); self._liquify_last_point=(x,y); self.object_compare_original=False
         self.refresh_object_canvas(); self.show_brush_preview(event)
 
