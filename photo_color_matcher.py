@@ -49,19 +49,25 @@ def make_toolbar_icon(kind, size=34, fg="#f7f9fb"):
         rect(5,4,24,25,width=w,r=1.2); rect(8,5.5,20,11.5,width=max(3,w-2))
         rect(9,17,20,24,width=max(3,w-2),r=.8)
     elif kind == "rect":
-        # marching-ants style rectangle
-        segs=[((5,5),(11,5)),((15,5),(23,5)),((5,23),(11,23)),((15,23),(23,23)),
-              ((5,5),(5,11)),((5,15),(5,23)),((23,5),(23,11)),((23,15),(23,23))]
-        for a,b in segs: line([a,b],width=max(4,w-1))
+        # High-quality dashed rectangular selection icon.
+        dash_w=max(3,round(size*0.052*S))
+        segs=[((5,5),(10.5,5)),((14.5,5),(23,5)),((5,23),(10.5,23)),((14.5,23),(23,23)),
+              ((5,5),(5,10.5)),((5,14.5),(5,23)),((23,5),(23,10.5)),((23,14.5),(23,23))]
+        for a,b in segs: line([a,b],width=dash_w)
     elif kind == "ellipse":
-        # Photoshop-style marching ants ellipse
-        bb = box(4, 6, 25, 23)
-        for a in range(0, 360, 28):
-            d.arc(bb, start=a, end=min(a + 15, 359), fill=c, width=w)
+        # High-quality marching-ants ellipse: thin, even dashes like the reference UI.
+        bb = box(4.2, 6.2, 25.8, 23.8)
+        dash_w = max(3, round(size * 0.052 * S))
+        for a in range(0, 360, 24):
+            d.arc(bb, start=a, end=a + 13, fill=c, width=dash_w)
     elif kind == "lasso":
-        # freehand lasso + tail
-        d.ellipse(box(4,5,24,20), outline=c, width=w)
-        line([(15,19.5),(12,24.5),(17,22.5)],width=max(4,w-1))
+        # Smooth free-selection/lasso icon based on the supplied reference.
+        lw=max(4, round(size*0.058*S))
+        pts=[(5.0,12.0),(5.8,8.8),(8.4,6.3),(12.0,5.0),(16.0,4.8),(20.0,6.0),
+             (23.0,8.4),(24.2,11.4),(23.7,14.4),(21.7,17.0),(18.2,18.8),(14.2,19.5),
+             (10.7,19.0),(8.0,17.6),(6.1,15.5),(5.0,12.0)]
+        d.line([(P(x),P(y)) for x,y in pts], fill=c, width=lw, joint="curve")
+        line([(14.0,19.1),(11.5,23.8),(15.0,22.4),(17.7,23.8)], width=max(3,lw-1))
     elif kind == "subtract_lasso":
         # lasso with a small minus badge: remove a polygon from current selection
         d.ellipse(box(4,5,22,19), outline=c, width=w)
@@ -69,20 +75,22 @@ def make_toolbar_icon(kind, size=34, fg="#f7f9fb"):
         d.ellipse(box(17,16,28,27), fill="#343b42", outline=c, width=max(3,w-2))
         line([(19.5,21.5),(25.5,21.5)], width=max(4,w-1))
     elif kind == "brush":
-        # tapered Photoshop-like brush
-        line([(8,22),(18.5,11.5)],width=w+3)
-        poly([(17.2,12.8),(21.4,4.2),(24.5,2.8),(22.6,10.8)])
-        d.ellipse(box(4,19,11.5,25), fill=c)
+        # Filled painter's brush with a tapered bristle tip.
+        poly([(6.0,25.0),(8.2,19.0),(11.2,17.0),(14.2,18.7),(14.0,21.7),(11.0,24.4)])
+        poly([(11.0,17.7),(19.7,7.0),(23.7,3.0),(25.4,4.7),(22.0,9.4),(14.1,19.6)])
+        d.ellipse(box(5.0,21.0,11.8,26.0), fill=c)
     elif kind == "eraser":
-        poly([(5,18.5),(15,7),(24,14.5),(13.5,25)], None)
-        line([(5.5,18.5),(15,7),(24,14.5),(13.5,25),(5.5,18.5)],width=w)
-        line([(9,20.8),(18.5,20.8)],width=max(4,w-1))
+        # Solid tilted eraser, matching the clean reference silhouette.
+        poly([(5.2,18.5),(15.0,7.0),(24.5,14.6),(14.1,25.0),(8.0,25.0)])
+        # dark separation edge gives the two-piece eraser look without reducing clarity
+        line([(9.1,20.7),(18.7,20.7)], width=max(3,round(size*0.045*S)), fill="#343b42")
     elif kind == "eyedrop":
-        # pipette
-        line([(7,23),(20,10)],width=w+2)
-        d.ellipse(box(18,4,25,11), outline=c, width=w)
-        line([(5,25),(10,20)],width=w+1)
-        line([(16.5,12.5),(20.5,16.5)],width=max(4,w-1))
+        # Texture-source sampler: crisp eyedropper silhouette.
+        lw=max(5,round(size*0.068*S))
+        line([(7.0,23.0),(19.0,11.0)],width=lw)
+        d.ellipse(box(17.3,4.2,24.8,11.7), outline=c, width=lw)
+        line([(5.0,25.0),(10.0,20.0)],width=max(4,lw-1))
+        line([(16.5,11.8),(20.4,15.7)],width=max(4,lw-1))
     elif kind == "remove":
         # clean X/delete symbol
         line([(7,7),(23,23)],width=w+2); line([(23,7),(7,23)],width=w+2)
@@ -127,14 +135,15 @@ def make_toolbar_icon(kind, size=34, fg="#f7f9fb"):
         d.ellipse(box(9,9,12.5,12.5), fill=c)
         poly([(16.5,20.5),(20,16.5),(24,20.5),(24,23),(16.5,23)])
     elif kind == "undo":
-        # clean counter-clockwise history arrow
-        d.arc(box(6,6,25,25), P(48), P(302), fill=c, width=w)
-        poly([(4.2,8.2),(12.1,4.2),(10.6,13.1)])
+        # Bold Photoshop-style counter-clockwise undo arrow.
+        lw=max(6,round(size*0.075*S))
+        d.arc(box(7.0,6.0,25.5,25.0), start=38, end=305, fill=c, width=lw)
+        poly([(4.0,8.0),(12.7,3.8),(11.1,13.2)])
     elif kind == "reset":
-        # full restore arrow, visually distinct from undo
-        d.arc(box(5,5,25,25), P(15), P(338), fill=c, width=w)
-        poly([(19.4,3.4),(26.2,7.9),(19.1,11.1)])
-        d.ellipse(box(13.2,13.2,16.8,16.8), fill=c)
+        # Matching clockwise restore arrow; same visual family as Undo.
+        lw=max(6,round(size*0.075*S))
+        d.arc(box(4.5,6.0,23.0,25.0), start=235, end=502, fill=c, width=lw)
+        poly([(26.0,8.0),(17.3,3.8),(18.9,13.2)])
     elif kind == "clear":
         line([(7,7),(23,23)],width=w+2); line([(23,7),(7,23)],width=w+2)
     else:
