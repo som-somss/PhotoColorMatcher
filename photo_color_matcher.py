@@ -113,6 +113,15 @@ def make_toolbar_icon(kind, size=34, fg="#f7f9fb"):
         d.ellipse(box(4,5,25,24), outline=c, width=w)
         d.ellipse(box(17.5,17,24.5,24), fill=(0,0,0,0))
         for x,y in [(10,10),(16.5,9),(20.5,13.5),(11.5,18)]: d.ellipse(box(x-1.6,y-1.6,x+1.6,y+1.6),fill=c)
+    elif kind == "liquify":
+        # Liquify / reshape tool: a smooth bent warp arrow.
+        lw=max(5,round(size*0.065*S))
+        # curved deformation path
+        pts=[(6.0,22.5),(8.0,18.0),(12.0,16.0),(17.5,16.0),(21.0,13.0),(22.5,8.0)]
+        d.line([(P(x),P(y)) for x,y in pts], fill=c, width=lw, joint="curve")
+        poly([(22.8,5.0),(17.7,10.0),(25.8,11.2)])
+        # subtle second contour suggesting pixels being pushed
+        d.arc(box(5.0,5.5,18.0,18.5), start=205, end=325, fill=c, width=max(3,lw-2))
     elif kind == "blur":
         # Photoshop-style blur tool: clean water droplet silhouette
         # pointed top with a rounded lower body
@@ -430,6 +439,9 @@ class PhotoColorMatcherApp(tk.Tk):
         self.inpaint_radius = tk.DoubleVar(value=5)
         self.remove_strength = tk.DoubleVar(value=70)
         self.blur_strength = tk.DoubleVar(value=35)
+        self.liquify_strength = tk.DoubleVar(value=45)
+        self._liquify_base = None
+        self._liquify_last_point = None
         self.brush_preview_id = None
         self.clone_source_mode = False
         self.clone_source_point = None
@@ -480,6 +492,8 @@ class PhotoColorMatcherApp(tk.Tk):
         self.bind_all("<Key-M>", lambda e: self.activate_move_mode())
         self.bind_all("<Key-u>", lambda e: self.activate_blur_brush_mode())
         self.bind_all("<Key-U>", lambda e: self.activate_blur_brush_mode())
+        self.bind_all("<Key-w>", lambda e: self.activate_liquify_mode())
+        self.bind_all("<Key-W>", lambda e: self.activate_liquify_mode())
         self.bind_all("<Key-c>", lambda e: self.toggle_object_compare())
         self.bind_all("<Key-C>", lambda e: self.toggle_object_compare())
         self.bind_all("<Delete>", lambda e: self.delete_selection_to_white())
@@ -613,6 +627,7 @@ class PhotoColorMatcherApp(tk.Tk):
         tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
         add_icon("color", "선택 색상 변경", self.apply_object_color)
         add_icon("blur", "브러시 블러 · U", self.activate_blur_brush_mode, "blur_brush")
+        add_icon("liquify", "성형 · 드래그하여 밀기 · W", self.activate_liquify_mode, "liquify")
         add_icon("cut_delete", "선택 영역 완전 삭제 · Delete", self.delete_selection_to_white)
         add_icon("remove", "선택 영역 삭제 · 주변 배경 복원", self.run_object_removal)
         add_icon("eyedrop", "질감 원본 선택 · Ctrl+Shift+D", self.activate_clone_source_mode, "clone_source")
@@ -641,6 +656,12 @@ class PhotoColorMatcherApp(tk.Tk):
         self.blur_strength_label = ttk.Label(opts, text="35", width=4)
         self.blur_strength_label.pack(side="left")
         self.blur_strength.trace_add("write", lambda *_: self.blur_strength_label.config(text=str(int(self.blur_strength.get()))))
+
+        ttk.Label(opts, text="성형 강도").pack(side="left", padx=(12,0))
+        ttk.Scale(opts, from_=1, to=100, variable=self.liquify_strength, length=110).pack(side="left", padx=6)
+        self.liquify_strength_label = ttk.Label(opts, text="45", width=4)
+        self.liquify_strength_label.pack(side="left")
+        self.liquify_strength.trace_add("write", lambda *_: self.liquify_strength_label.config(text=str(int(self.liquify_strength.get()))))
         self.clone_status_label = ttk.Label(
             opts,
             text="자동 복원 모드 · Ctrl+Shift+D → 사진의 질감 원본 클릭 시 복제 모드",
@@ -797,7 +818,7 @@ class PhotoColorMatcherApp(tk.Tk):
             self.object_select_points = []
         self.hide_brush_preview()
         if hasattr(self, "object_canvas"):
-            cursor = "fleur" if tool == "move" else ("pencil" if tool in ("brush", "eraser", "blur_brush") else ("tcross" if tool in ("crop", "canvas_crop") else "crosshair"))
+            cursor = "fleur" if tool == "move" else ("pencil" if tool in ("brush", "eraser", "blur_brush", "liquify") else ("tcross" if tool in ("crop", "canvas_crop") else "crosshair"))
             self.object_canvas.configure(cursor=cursor)
         return "break"
 
@@ -1519,6 +1540,67 @@ class PhotoColorMatcherApp(tk.Tk):
     def object_canvas_release(self, event):
         return
 
+    def activate_liquify_mode(self):
+        """Photoshop-like liquify push tool. Drag inside the brush to push pixels."""
+        if self.object_result is None:
+            messagebox.showwarning(APP_TITLE, "먼저 사진을 열어주세요.")
+            return "break"
+        self.clone_source_mode = False
+        self._liquify_base = None
+        self._liquify_last_point = None
+        self._set_remove_tool_bindings("liquify")
+        if hasattr(self, "object_select_status"):
+            self.object_select_status.config(text="성형 도구 · W · 원하는 부분을 드래그하면 브러시 안의 픽셀이 드래그 방향으로 부드럽게 이동합니다.")
+        try: self.status_var.set("성형 도구: 드래그하여 형태를 밀어 조정하세요. 브러시 크기와 성형 강도를 조절할 수 있습니다.")
+        except Exception: pass
+        return "break"
+
+    def _start_liquify_stroke(self, event):
+        if self.object_result is None: return
+        self._liquify_base = self.object_result.copy()
+        self._liquify_last_point = self._canvas_to_image(event.x, event.y)
+        self.show_brush_preview(event)
+
+    def _paint_liquify_stroke(self, event):
+        if self.object_result is None: return
+        if self._liquify_last_point is None:
+            self._start_liquify_stroke(event); return
+        x, y = self._canvas_to_image(event.x, event.y)
+        px, py = self._liquify_last_point
+        h, w = self.object_result.shape[:2]
+        if not (0 <= x < w and 0 <= y < h): return
+        dx, dy = x-px, y-py
+        dist = (dx*dx + dy*dy) ** 0.5
+        if dist < 0.5: return
+        scale=max(float(self.object_display_scale),1e-6)
+        radius=max(3,int(self.brush_size.get()/scale/2))
+        strength=max(0.01,min(1.0,float(self.liquify_strength.get())/100.0))
+        # Limit a single event's displacement so fast mouse motion remains smooth.
+        max_step=max(1.0,radius*0.35)
+        if dist > max_step:
+            f=max_step/dist; dx*=f; dy*=f
+        yy, xx = np.ogrid[:h, :w]
+        d2=(xx-x)**2+(yy-y)**2
+        inside=d2 <= radius*radius
+        fall=np.zeros((h,w),np.float32)
+        fall[inside]=(1.0-np.sqrt(d2[inside])/radius)**2
+        # Inverse remap: destination pixels sample from the opposite direction.
+        map_x=np.tile(np.arange(w,dtype=np.float32),(h,1)) - fall*(dx*strength)
+        map_y=np.tile(np.arange(h,dtype=np.float32)[:,None],(1,w)) - fall*(dy*strength)
+        self.object_result=cv2.remap(self.object_result,map_x,map_y,cv2.INTER_CUBIC,borderMode=cv2.BORDER_REFLECT)
+        self._liquify_last_point=(x,y)
+        self.object_compare_original=False
+        self.refresh_object_canvas(); self.show_brush_preview(event)
+
+    def _finish_liquify_stroke(self):
+        if isinstance(self._liquify_base,np.ndarray) and self.object_result is not None:
+            if not np.array_equal(self._liquify_base,self.object_result):
+                self.object_history.append(self._liquify_base.copy())
+        self._liquify_base=None
+        self._liquify_last_point=None
+        if hasattr(self,"object_select_status"):
+            self.object_select_status.config(text=f"성형 적용 완료 · 강도 {int(self.liquify_strength.get())} · W로 계속 작업하거나 Ctrl+Z로 실행 취소")
+
     def activate_blur_brush_mode(self):
         """Photoshop-like blur brush: paint only where blur is wanted."""
         if self.object_result is None:
@@ -1751,6 +1833,8 @@ class PhotoColorMatcherApp(tk.Tk):
         elif tool == "blur_brush":
             self._last_brush_point = None
             self._paint_blur_stroke(event)
+        elif tool == "liquify":
+            self._start_liquify_stroke(event)
         return "break"
 
     def object_canvas_drag(self, event):
@@ -1769,6 +1853,8 @@ class PhotoColorMatcherApp(tk.Tk):
             self.erase_object_mask(event)
         elif tool == "blur_brush":
             self._paint_blur_stroke(event)
+        elif tool == "liquify":
+            self._paint_liquify_stroke(event)
         return "break"
 
     def object_canvas_release(self, event):
@@ -1782,6 +1868,8 @@ class PhotoColorMatcherApp(tk.Tk):
             self.shape_select_end(event)
         elif self.active_remove_tool == "blur_brush":
             self._finish_blur_stroke()
+        elif self.active_remove_tool == "liquify":
+            self._finish_liquify_stroke()
         self._last_brush_point = None
         return "break"
 
@@ -1789,7 +1877,7 @@ class PhotoColorMatcherApp(tk.Tk):
         """현재 브러시 크기를 마우스 위치에 빨간 원으로 표시."""
         if self.object_result is None:
             return
-        if self.active_remove_tool not in ("brush", "eraser", "blur_brush"):
+        if self.active_remove_tool not in ("brush", "eraser", "blur_brush", "liquify"):
             self.hide_brush_preview()
             return
         if self.brush_preview_id is not None:
@@ -1802,7 +1890,7 @@ class PhotoColorMatcherApp(tk.Tk):
         self.brush_preview_id = self.object_canvas.create_oval(
             event.x - radius, event.y - radius,
             event.x + radius, event.y + radius,
-            outline="#00e5ff" if self.active_remove_tool == "eraser" else ("#7dd3fc" if self.active_remove_tool == "blur_brush" else "#ff3b30"), width=2, tags=("brush_preview",)
+            outline="#00e5ff" if self.active_remove_tool == "eraser" else ("#7dd3fc" if self.active_remove_tool == "blur_brush" else ("#c084fc" if self.active_remove_tool == "liquify" else "#ff3b30")), width=2, tags=("brush_preview",)
         )
         self.object_canvas.tag_raise(self.brush_preview_id)
 
