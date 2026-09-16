@@ -1544,46 +1544,57 @@ class PhotoColorMatcherApp(tk.Tk):
             self.show_brush_preview(event)
 
     def erase_object_mask(self, event):
-        """Erase the visible selection/brush marking only; never alter image pixels."""
+        """Subtract the eraser stroke from every live selection mask.
+
+        Important: do NOT merge/OR legacy masks before erasing.  A stale copy can
+        otherwise restore pixels that were erased on the previous mouse event.
+        """
         if self.object_result is None:
-            return
+            return "break"
 
-        # Recover the canonical visible mask even when an older selection tool
-        # populated only selection_mask/object_edit_mask.
-        base = None
-        for candidate in (getattr(self, "object_mask", None),
-                          getattr(self, "selection_mask", None),
-                          getattr(self, "object_edit_mask", None)):
-            if isinstance(candidate, np.ndarray) and candidate.shape[:2] == self.object_result.shape[:2]:
-                if base is None:
-                    base = candidate.copy()
-                else:
-                    base = cv2.bitwise_or(base, candidate)
-        if base is None:
-            base = np.zeros(self.object_result.shape[:2], dtype=np.uint8)
-        self.object_mask = base
-
-        scale = max(self.object_display_scale, 1e-6)
+        scale = max(float(self.object_display_scale), 1e-6)
         ox, oy = self.object_display_offset
-        x = int((event.x - ox) / scale)
-        y = int((event.y - oy) / scale)
-        h, w = self.object_mask.shape
+        x = int(round((event.x - ox) / scale))
+        y = int(round((event.y - oy) / scale))
+        h, w = self.object_result.shape[:2]
         if not (0 <= x < w and 0 <= y < h):
-            return
+            return "break"
 
-        radius = max(1, int(self.brush_size.get() / scale / 2))
+        # brush_size is the on-screen diameter. Convert it to image pixels.
+        radius = max(1, int(round(float(self.brush_size.get()) / scale / 2.0)))
         prev = getattr(self, "_last_brush_point", None)
-        if prev is not None:
-            cv2.line(self.object_mask, prev, (x, y), 0, radius * 2, cv2.LINE_AA)
-        cv2.circle(self.object_mask, (x, y), radius, 0, -1, cv2.LINE_AA)
-        self._last_brush_point = (x, y)
 
-        # One source of truth: all selection/edit commands now see exactly the
-        # same mask, so no stale green outline can remain after erasing.
+        # Erase IN PLACE from every mask that may be used by legacy commands.
+        # This prevents an old mask copy from resurrecting the erased marking.
+        valid_masks = []
+        for name in ("object_mask", "selection_mask", "object_edit_mask"):
+            m = getattr(self, name, None)
+            if isinstance(m, np.ndarray) and m.shape[:2] == (h, w):
+                valid_masks.append(m)
+
+        if not valid_masks:
+            self.object_mask = np.zeros((h, w), dtype=np.uint8)
+            self.selection_mask = self.object_mask.copy()
+            self.object_edit_mask = self.object_mask.copy()
+            valid_masks = [self.object_mask, self.selection_mask, self.object_edit_mask]
+
+        for m in valid_masks:
+            if prev is not None:
+                cv2.line(m, prev, (x, y), 0, radius * 2, cv2.LINE_8)
+            cv2.circle(m, (x, y), radius, 0, -1, cv2.LINE_8)
+
+        # Canonicalize all references AFTER subtraction only.
+        canonical = getattr(self, "object_mask", None)
+        if not (isinstance(canonical, np.ndarray) and canonical.shape[:2] == (h, w)):
+            canonical = valid_masks[0]
+            self.object_mask = canonical.copy()
         self.selection_mask = self.object_mask.copy()
         self.object_edit_mask = self.object_mask.copy()
+
+        self._last_brush_point = (x, y)
         self.refresh_object_canvas()
         self.show_brush_preview(event)
+        return "break"
 
     def clear_object_mask(self):
         if self.object_mask is not None:
