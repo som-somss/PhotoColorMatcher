@@ -848,6 +848,12 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_layers.append(layer)
         self.active_layer_index = len(self.object_layers)-1
         self.move_mask = layer["mask"].copy()
+        # The green contour is only a selection/edit guide. Once the crop
+        # becomes an independent movable layer, remove that guide so it does
+        # not remain on the canvas. The layer itself and every existing
+        # editing feature remain unchanged.
+        if isinstance(getattr(self, "object_edit_mask", None), np.ndarray):
+            self.object_edit_mask[:] = 0
         self.move_drag_start = None
         self.move_offset = (0,0)
         self._set_remove_tool_bindings("move")
