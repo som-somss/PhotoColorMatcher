@@ -13,45 +13,96 @@ APP_TITLE = "Photo Color Matcher Pro"
 SUPPORTED = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
-def make_toolbar_icon(kind, size=28, fg="#f5f7fa"):
-    """Create simple Photoshop-like monochrome toolbar icons without external image files."""
-    im = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+def make_toolbar_icon(kind, size=30, fg="#f7f9fb"):
+    """Render crisp Photoshop-style monochrome icons using 4x supersampling.
+
+    The icon is drawn at high resolution and reduced with LANCZOS, so the EXE
+    stays self-contained while curves/diagonals remain smooth on Windows.
+    """
+    S = 4
+    N = size * S
+    im = Image.new("RGBA", (N, N), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
-    w = max(2, size // 12)
     c = fg
-    m = 4
+    w = max(5, round(size * 0.065 * S))
+
+    def P(v): return round(v * S)
+    def box(x0, y0, x1, y1): return tuple(P(v) for v in (x0, y0, x1, y1))
+    def line(points, width=w, fill=c):
+        pts=[(P(x),P(y)) for x,y in points]
+        d.line(pts, fill=fill, width=width, joint="curve")
+        r=width//2
+        for x,y in (pts[0], pts[-1]): d.ellipse((x-r,y-r,x+r,y+r), fill=fill)
+    def ellipse(x0,y0,x1,y1,width=w,fill=None): d.ellipse(box(x0,y0,x1,y1), outline=c if fill is None else None, fill=fill, width=width)
+    def rect(x0,y0,x1,y1,width=w,r=0,fill=None):
+        kw={"outline":c if fill is None else None,"fill":fill,"width":width}
+        d.rounded_rectangle(box(x0,y0,x1,y1), radius=P(r), **kw) if r else d.rectangle(box(x0,y0,x1,y1), **kw)
+    def poly(points, fill=c): d.polygon([(P(x),P(y)) for x,y in points], fill=fill)
+
     if kind == "open":
-        d.rectangle((4,10,24,22), outline=c, width=w); d.polygon([(4,10),(10,10),(12,7),(22,7),(24,10)], fill=c)
+        # folder
+        poly([(4.5,10),(10,10),(12,7.5),(22.5,7.5),(24.5,10.5),(24.5,23),(4.5,23)], None)
+        line([(5,10.5),(10,10.5),(12,8),(22,8),(24,10.5)], width=w)
+        rect(4.5,10.5,24.5,23,width=w,r=1.2)
+        line([(7,14),(22,14)], width=max(3,w-2))
     elif kind == "save":
-        d.rectangle((5,4,23,24), outline=c, width=w); d.rectangle((8,5,19,11), fill=c); d.rectangle((9,16,19,22), outline=c, width=w)
+        rect(5,4,24,25,width=w,r=1.2); rect(8,5.5,20,11.5,width=max(3,w-2))
+        rect(9,17,20,24,width=max(3,w-2),r=.8)
     elif kind == "rect":
-        for a,b in [((5,5),(12,5)),((16,5),(23,5)),((5,23),(12,23)),((16,23),(23,23)),((5,5),(5,12)),((5,16),(5,23)),((23,5),(23,12)),((23,16),(23,23))]: d.line((a,b),fill=c,width=w)
+        # marching-ants style rectangle
+        segs=[((5,5),(11,5)),((15,5),(23,5)),((5,23),(11,23)),((15,23),(23,23)),
+              ((5,5),(5,11)),((5,15),(5,23)),((23,5),(23,11)),((23,15),(23,23))]
+        for a,b in segs: line([a,b],width=max(4,w-1))
     elif kind == "ellipse":
-        d.ellipse((4,6,24,22), outline=c, width=w)
+        d.ellipse(box(4,6,25,23), outline=c, width=w)
     elif kind == "lasso":
-        d.ellipse((4,5,23,19), outline=c, width=w); d.line((13,19,10,25,16,22), fill=c, width=w)
+        # freehand lasso + tail
+        d.ellipse(box(4,5,24,20), outline=c, width=w)
+        line([(15,19.5),(12,24.5),(17,22.5)],width=max(4,w-1))
+    elif kind == "subtract_lasso":
+        # lasso with a small minus badge: remove a polygon from current selection
+        d.ellipse(box(4,5,22,19), outline=c, width=w)
+        line([(14,18.5),(11.5,24),(16.5,21.5)],width=max(4,w-1))
+        d.ellipse(box(17,16,28,27), fill="#343b42", outline=c, width=max(3,w-2))
+        line([(19.5,21.5),(25.5,21.5)], width=max(4,w-1))
     elif kind == "brush":
-        d.line((7,22,18,11), fill=c, width=w+2); d.polygon([(18,11),(21,4),(24,3),(22,10)], fill=c); d.ellipse((4,20,11,25), fill=c)
+        # tapered Photoshop-like brush
+        line([(8,22),(18.5,11.5)],width=w+3)
+        poly([(17.2,12.8),(21.4,4.2),(24.5,2.8),(22.6,10.8)])
+        d.ellipse(box(4,19,11.5,25), fill=c)
     elif kind == "eraser":
-        d.polygon([(5,19),(15,7),(23,14),(13,25)], outline=c, fill=None); d.line((9,20,18,20),fill=c,width=w)
+        poly([(5,18.5),(15,7),(24,14.5),(13.5,25)], None)
+        line([(5.5,18.5),(15,7),(24,14.5),(13.5,25),(5.5,18.5)],width=w)
+        line([(9,20.8),(18.5,20.8)],width=max(4,w-1))
     elif kind == "eyedrop":
-        d.line((7,22,20,9),fill=c,width=w+2); d.ellipse((18,4,24,10),outline=c,width=w); d.line((5,24,10,19),fill=c,width=w)
+        # pipette
+        line([(7,23),(20,10)],width=w+2)
+        d.ellipse(box(18,4,25,11), outline=c, width=w)
+        line([(5,25),(10,20)],width=w+1)
+        line([(16.5,12.5),(20.5,16.5)],width=max(4,w-1))
     elif kind == "remove":
-        d.rounded_rectangle((5,8,23,21), radius=3, outline=c, width=w); d.line((8,5,20,24),fill=c,width=w); d.line((20,5,8,24),fill=c,width=w)
+        # clean X/delete symbol
+        line([(7,7),(23,23)],width=w+2); line([(23,7),(7,23)],width=w+2)
     elif kind == "color":
-        d.ellipse((4,5,24,23), outline=c, width=w);
-        for xy in [(10,10),(17,9),(20,15),(12,18)]: d.ellipse((xy[0]-2,xy[1]-2,xy[0]+2,xy[1]+2),fill=c)
+        # artist palette
+        d.ellipse(box(4,5,25,24), outline=c, width=w)
+        d.ellipse(box(17.5,17,24.5,24), fill=(0,0,0,0))
+        for x,y in [(10,10),(16.5,9),(20.5,13.5),(11.5,18)]: d.ellipse(box(x-1.6,y-1.6,x+1.6,y+1.6),fill=c)
     elif kind == "clone":
-        d.ellipse((10,4,18,12), fill=c); d.rectangle((8,11,20,17), fill=c); d.rounded_rectangle((5,17,23,24), radius=2, outline=c, width=w)
+        ellipse(11,4,19,12,fill=c); rect(8,11,22,17,fill=c,r=1)
+        rect(5,17,25,25,width=w,r=2)
     elif kind == "undo":
-        d.arc((6,6,24,24),70,300,fill=c,width=w); d.polygon([(5,8),(12,5),(10,12)],fill=c)
+        d.arc(box(6,6,25,25), P(65), P(300), fill=c, width=w)
+        poly([(5,8),(12,4.5),(10.5,12.5)])
     elif kind == "reset":
-        d.arc((5,5,24,24),20,330,fill=c,width=w); d.polygon([(20,4),(25,8),(19,10)],fill=c)
+        d.arc(box(5,5,25,25), P(20), P(330), fill=c, width=w)
+        poly([(20,3.8),(25.5,8),(19,10.5)])
     elif kind == "clear":
-        d.line((7,7,21,21),fill=c,width=w+1); d.line((21,7,7,21),fill=c,width=w+1)
+        line([(7,7),(23,23)],width=w+2); line([(23,7),(7,23)],width=w+2)
     else:
-        d.rectangle((6,6,22,22), outline=c, width=w)
-    return im
+        rect(6,6,24,24,width=w,r=1)
+
+    return im.resize((size, size), Image.Resampling.LANCZOS)
 
 class ToolTip:
     def __init__(self, widget, text):
@@ -429,9 +480,9 @@ class PhotoColorMatcherApp(tk.Tk):
         self._tool_buttons = {}
 
         def add_icon(kind, tip, command, tool_key=None, gap=2):
-            img = ImageTk.PhotoImage(make_toolbar_icon(kind, 28))
+            img = ImageTk.PhotoImage(make_toolbar_icon(kind, 30))
             self._toolbar_images[tip] = img
-            b = tk.Button(bar, image=img, command=command, width=38, height=38,
+            b = tk.Button(bar, image=img, command=command, width=40, height=40,
                           bg="#343b42", activebackground="#2387f3", relief="flat", bd=0,
                           highlightthickness=1, highlightbackground="#4a535c", cursor="hand2")
             b.pack(side="left", padx=gap)
@@ -446,6 +497,7 @@ class PhotoColorMatcherApp(tk.Tk):
         add_icon("lasso", "직접 선택", lambda: self.set_selection_tool("free"), "free")
         add_icon("brush", "브러시 · 마스크 추가", self.activate_brush_mode, "brush")
         add_icon("eraser", "브러시 마킹 지우기", self.activate_mask_eraser_mode, "eraser")
+        add_icon("subtract_lasso", "직접 선택하여 선택영역 해제", self.activate_selection_subtract_mode, "free_subtract")
         tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
         add_icon("color", "선택 색상 변경", self.apply_object_color)
         add_icon("remove", "선택 영역 삭제", self.run_object_removal)
@@ -487,7 +539,7 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_canvas.bind("<Button-1>", self.object_canvas_click)
         self.object_canvas.bind("<B1-Motion>", self.object_canvas_drag)
         self.object_canvas.bind("<ButtonRelease-1>", self.object_canvas_release)
-        self.object_canvas.bind("<Double-Button-1>", lambda e: self.finish_manual_selection() if self.active_remove_tool == "free" else None)
+        self.object_canvas.bind("<Double-Button-1>", lambda e: self.finish_manual_selection() if self.active_remove_tool in ("free", "free_subtract") else None)
         self.bind_all("<Control-d>", self.activate_clone_source_mode)
         self.bind_all("<Control-D>", self.activate_clone_source_mode)
         self.object_canvas.bind("<Motion>", self.show_brush_preview)
@@ -585,8 +637,8 @@ class PhotoColorMatcherApp(tk.Tk):
         """Keep exactly one active mouse tool."""
         self.active_remove_tool = tool
         self._sync_tool_buttons()
-        self.object_select_mode = (tool == "free")
-        if tool == "free":
+        self.object_select_mode = (tool in ("free", "free_subtract"))
+        if tool in ("free", "free_subtract"):
             self.object_select_points = []
         else:
             self.object_select_points = []
@@ -815,6 +867,19 @@ class PhotoColorMatcherApp(tk.Tk):
         try: self.status_var.set("마스크 지우개: 선택 영역 중 불필요한 부분을 드래그하여 지웁니다.")
         except Exception: pass
 
+    def activate_selection_subtract_mode(self):
+        """Trace a polygon and subtract it from the current selection mask."""
+        self.clone_source_mode = False
+        self.selection_tool.set("free")
+        self.object_select_points = []
+        self._set_remove_tool_bindings("free_subtract")
+        if hasattr(self, "object_select_status"):
+            self.object_select_status.config(text="선택영역 해제 · 제외할 부분의 외곽선을 따라 클릭하고 시작점을 다시 클릭하거나 더블클릭하세요.")
+        try:
+            self.status_var.set("선택영역 해제: 제외할 부분을 직접 선택하세요. 기존 사진은 변경되지 않습니다.")
+        except Exception:
+            pass
+
     def finish_manual_selection(self):
         if self.object_result is None or len(self.object_select_points) < 3:
             self.object_select_status.config(text="최소 3개 이상의 점을 찍어주세요.")
@@ -822,12 +887,25 @@ class PhotoColorMatcherApp(tk.Tk):
         pts = np.array(self.object_select_points, dtype=np.int32)
         mask = np.zeros(self.object_result.shape[:2], dtype=np.uint8)
         cv2.fillPoly(mask, [pts], 255)
-        self.object_mask = mask
-        self.selection_mask = mask.copy()
-        self.object_edit_mask = mask.copy()
+        if self.active_remove_tool == "free_subtract":
+            # Subtract only from the selection; never alter image pixels here.
+            if self.object_mask is None or self.object_mask.shape != mask.shape:
+                self.object_mask = np.zeros_like(mask)
+            self.object_mask[mask > 0] = 0
+            if isinstance(self.object_edit_mask, np.ndarray) and self.object_edit_mask.shape == mask.shape:
+                self.object_edit_mask[mask > 0] = 0
+            if hasattr(self, "selection_mask") and isinstance(self.selection_mask, np.ndarray) and self.selection_mask.shape == mask.shape:
+                self.selection_mask[mask > 0] = 0
+            else:
+                self.selection_mask = self.object_mask.copy()
+            self.object_select_status.config(text="선택영역 해제 완료 · 필요한 부분만 선택 영역에 남았습니다.")
+        else:
+            self.object_mask = mask
+            self.selection_mask = mask.copy()
+            self.object_edit_mask = mask.copy()
+            self.object_select_status.config(text="직접 선택 완료 · 색상 변경/삭제 가능")
         self.object_select_mode = False
         self.object_select_points = []
-        self.object_select_status.config(text="직접 선택 완료 · 색상 변경/삭제 가능")
         self.refresh_object_canvas()
 
     def _canvas_to_image(self, cx, cy):
@@ -942,7 +1020,7 @@ class PhotoColorMatcherApp(tk.Tk):
             self.shape_select_start(event)
             return "break"
 
-        if tool == "free":
+        if tool in ("free", "free_subtract"):
             x, y = self._canvas_to_image(event.x, event.y)
             h, w = self.object_result.shape[:2]
             if not (0 <= x < w and 0 <= y < h):
@@ -958,8 +1036,9 @@ class PhotoColorMatcherApp(tk.Tk):
                     self.finish_manual_selection()
                     return "break"
             self.object_select_points.append((x, y))
+            mode_text = "선택영역 해제 중" if tool == "free_subtract" else "직접 선택 중"
             self.object_select_status.config(
-                text=f"직접 선택 중 · {len(self.object_select_points)}개 점 · 시작점을 다시 클릭하거나 더블클릭하면 완료"
+                text=f"{mode_text} · {len(self.object_select_points)}개 점 · 시작점을 다시 클릭하거나 더블클릭하면 완료"
             )
             self.refresh_object_canvas()
             return "break"
