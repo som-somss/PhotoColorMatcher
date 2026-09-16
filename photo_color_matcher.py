@@ -7,10 +7,63 @@ from tkinter import ttk, filedialog, messagebox, colorchooser
 
 import cv2
 import numpy as np
-from PIL import Image, ImageOps, ImageTk, ImageEnhance
+from PIL import Image, ImageOps, ImageTk, ImageEnhance, ImageDraw
 
 APP_TITLE = "Photo Color Matcher Pro"
 SUPPORTED = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def make_toolbar_icon(kind, size=28, fg="#f5f7fa"):
+    """Create simple Photoshop-like monochrome toolbar icons without external image files."""
+    im = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    w = max(2, size // 12)
+    c = fg
+    m = 4
+    if kind == "open":
+        d.rectangle((4,10,24,22), outline=c, width=w); d.polygon([(4,10),(10,10),(12,7),(22,7),(24,10)], fill=c)
+    elif kind == "save":
+        d.rectangle((5,4,23,24), outline=c, width=w); d.rectangle((8,5,19,11), fill=c); d.rectangle((9,16,19,22), outline=c, width=w)
+    elif kind == "rect":
+        for a,b in [((5,5),(12,5)),((16,5),(23,5)),((5,23),(12,23)),((16,23),(23,23)),((5,5),(5,12)),((5,16),(5,23)),((23,5),(23,12)),((23,16),(23,23))]: d.line((a,b),fill=c,width=w)
+    elif kind == "ellipse":
+        d.ellipse((4,6,24,22), outline=c, width=w)
+    elif kind == "lasso":
+        d.ellipse((4,5,23,19), outline=c, width=w); d.line((13,19,10,25,16,22), fill=c, width=w)
+    elif kind == "brush":
+        d.line((7,22,18,11), fill=c, width=w+2); d.polygon([(18,11),(21,4),(24,3),(22,10)], fill=c); d.ellipse((4,20,11,25), fill=c)
+    elif kind == "eraser":
+        d.polygon([(5,19),(15,7),(23,14),(13,25)], outline=c, fill=None); d.line((9,20,18,20),fill=c,width=w)
+    elif kind == "eyedrop":
+        d.line((7,22,20,9),fill=c,width=w+2); d.ellipse((18,4,24,10),outline=c,width=w); d.line((5,24,10,19),fill=c,width=w)
+    elif kind == "remove":
+        d.rounded_rectangle((5,8,23,21), radius=3, outline=c, width=w); d.line((8,5,20,24),fill=c,width=w); d.line((20,5,8,24),fill=c,width=w)
+    elif kind == "color":
+        d.ellipse((4,5,24,23), outline=c, width=w);
+        for xy in [(10,10),(17,9),(20,15),(12,18)]: d.ellipse((xy[0]-2,xy[1]-2,xy[0]+2,xy[1]+2),fill=c)
+    elif kind == "clone":
+        d.ellipse((10,4,18,12), fill=c); d.rectangle((8,11,20,17), fill=c); d.rounded_rectangle((5,17,23,24), radius=2, outline=c, width=w)
+    elif kind == "undo":
+        d.arc((6,6,24,24),70,300,fill=c,width=w); d.polygon([(5,8),(12,5),(10,12)],fill=c)
+    elif kind == "reset":
+        d.arc((5,5,24,24),20,330,fill=c,width=w); d.polygon([(20,4),(25,8),(19,10)],fill=c)
+    elif kind == "clear":
+        d.line((7,7,21,21),fill=c,width=w+1); d.line((21,7,7,21),fill=c,width=w+1)
+    else:
+        d.rectangle((6,6,22,22), outline=c, width=w)
+    return im
+
+class ToolTip:
+    def __init__(self, widget, text):
+        self.widget, self.text, self.tip = widget, text, None
+        widget.bind("<Enter>", self.show, add="+"); widget.bind("<Leave>", self.hide, add="+")
+    def show(self, _=None):
+        if self.tip: return
+        x=self.widget.winfo_rootx()+8; y=self.widget.winfo_rooty()+self.widget.winfo_height()+6
+        self.tip=tk.Toplevel(self.widget); self.tip.wm_overrideredirect(True); self.tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.tip,text=self.text,bg="#1f252b",fg="white",padx=7,pady=4,font=("Segoe UI",9)).pack()
+    def hide(self, _=None):
+        if self.tip: self.tip.destroy(); self.tip=None
 
 
 def read_image(path):
@@ -369,22 +422,41 @@ class PhotoColorMatcherApp(tk.Tk):
         wrap = ttk.Frame(parent, padding=10)
         wrap.pack(fill="both", expand=True)
 
-        bar = ttk.Frame(wrap)
+        # Compact icon toolbar: Photoshop-like layout, but all icons are drawn internally.
+        bar = tk.Frame(wrap, bg="#20262c", padx=6, pady=6)
         bar.pack(fill="x")
-        ttk.Button(bar, text="사진 열기", command=self.open_object_image).pack(side="left")
-        ttk.Button(bar, text="사각형 선택", command=lambda: self.set_selection_tool("rect")).pack(side="left", padx=3)
-        ttk.Button(bar, text="타원형 선택", command=lambda: self.set_selection_tool("ellipse")).pack(side="left", padx=3)
-        ttk.Button(bar, text="직접 선택", command=lambda: self.set_selection_tool("free")).pack(side="left", padx=3)
-        ttk.Button(bar, text="브러시", command=self.activate_brush_mode).pack(side="left", padx=(6, 0))
-        ttk.Button(bar, text="마스크 지우개", command=self.activate_mask_eraser_mode).pack(side="left", padx=3)
-        ttk.Button(bar, text="선택 색상 변경", command=self.apply_object_color).pack(side="left", padx=6)
-        ttk.Button(bar, text="선택 영역 삭제", command=self.run_object_removal).pack(side="left", padx=6)
-        ttk.Button(bar, text="마스크 지우기", command=self.clear_object_mask).pack(side="left")
-        ttk.Button(bar, text="실행 취소", command=self.undo_object_removal).pack(side="left", padx=6)
-        ttk.Button(bar, text="원본 복원", command=self.restore_object_original).pack(side="left")
-        ttk.Button(bar, text="질감 원본 선택 (Ctrl+D)", command=self.activate_clone_source_mode).pack(side="left", padx=(12, 0))
-        ttk.Button(bar, text="질감 선택 해제", command=self.clear_clone_source).pack(side="left", padx=6)
-        ttk.Button(bar, text="결과 저장", command=self.save_object_result).pack(side="right")
+        self._toolbar_images = {}
+        self._tool_buttons = {}
+
+        def add_icon(kind, tip, command, tool_key=None, gap=2):
+            img = ImageTk.PhotoImage(make_toolbar_icon(kind, 28))
+            self._toolbar_images[tip] = img
+            b = tk.Button(bar, image=img, command=command, width=38, height=38,
+                          bg="#343b42", activebackground="#2387f3", relief="flat", bd=0,
+                          highlightthickness=1, highlightbackground="#4a535c", cursor="hand2")
+            b.pack(side="left", padx=gap)
+            ToolTip(b, tip)
+            if tool_key: self._tool_buttons[tool_key] = b
+            return b
+
+        add_icon("open", "사진 열기", self.open_object_image)
+        tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
+        add_icon("rect", "사각형 선택", lambda: self.set_selection_tool("rect"), "rect")
+        add_icon("ellipse", "타원형 선택", lambda: self.set_selection_tool("ellipse"), "ellipse")
+        add_icon("lasso", "직접 선택", lambda: self.set_selection_tool("free"), "free")
+        add_icon("brush", "브러시 · 마스크 추가", self.activate_brush_mode, "brush")
+        add_icon("eraser", "브러시 마킹 지우기", self.activate_mask_eraser_mode, "eraser")
+        tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
+        add_icon("color", "선택 색상 변경", self.apply_object_color)
+        add_icon("remove", "선택 영역 삭제", self.run_object_removal)
+        add_icon("eyedrop", "질감 원본 선택 · Ctrl+D", self.activate_clone_source_mode, "clone_source")
+        add_icon("clear", "질감 선택 해제", self.clear_clone_source)
+        tk.Frame(bar, width=1, bg="#66717b").pack(side="left", fill="y", padx=6)
+        add_icon("undo", "실행 취소", self.undo_object_removal)
+        add_icon("reset", "원본 복원", self.restore_object_original)
+        save_btn = add_icon("save", "결과 저장", self.save_object_result)
+        save_btn.pack_configure(side="right")
+        self._sync_tool_buttons()
 
         opts = ttk.Frame(wrap)
         opts.pack(fill="x", pady=(8, 5))
@@ -496,9 +568,23 @@ class PhotoColorMatcherApp(tk.Tk):
                 except Exception: pass
         return "break"
 
+    def _sync_tool_buttons(self):
+        """Highlight only the currently active selection/paint tool."""
+        buttons = getattr(self, "_tool_buttons", {})
+        active = getattr(self, "active_remove_tool", "brush")
+        for key, btn in buttons.items():
+            selected = (key == active)
+            try:
+                btn.configure(bg="#2387f3" if selected else "#343b42",
+                              activebackground="#2387f3",
+                              highlightbackground="#66b3ff" if selected else "#4a535c")
+            except Exception:
+                pass
+
     def _set_remove_tool_bindings(self, tool):
         """Keep exactly one active mouse tool."""
         self.active_remove_tool = tool
+        self._sync_tool_buttons()
         self.object_select_mode = (tool == "free")
         if tool == "free":
             self.object_select_points = []
@@ -726,7 +812,7 @@ class PhotoColorMatcherApp(tk.Tk):
         self._set_remove_tool_bindings("eraser")
         if hasattr(self, "object_select_status"):
             self.object_select_status.config(text="마스크 지우개 모드 · 드래그하여 불필요하게 선택된 부분만 지우세요.")
-        try: self.status_var.set("마스크 지우개: 빨간 선택 영역 중 불필요한 부분을 드래그하여 지웁니다.")
+        try: self.status_var.set("마스크 지우개: 선택 영역 중 불필요한 부분을 드래그하여 지웁니다.")
         except Exception: pass
 
     def finish_manual_selection(self):
@@ -916,8 +1002,7 @@ class PhotoColorMatcherApp(tk.Tk):
         self.brush_preview_id = self.object_canvas.create_oval(
             event.x - radius, event.y - radius,
             event.x + radius, event.y + radius,
-            outline="#00e5ff" if self.active_remove_tool == "eraser" else "#ff3b30",
-            width=2, tags=("brush_preview",)
+            outline="#00e5ff" if self.active_remove_tool == "eraser" else "#ff3b30", width=2, tags=("brush_preview",)
         )
         self.object_canvas.tag_raise(self.brush_preview_id)
 
@@ -940,8 +1025,6 @@ class PhotoColorMatcherApp(tk.Tk):
         if 0 <= x < w and 0 <= y < h:
             radius = max(1, int(self.brush_size.get() / max(scale, 1e-6) / 2))
             cv2.circle(self.object_mask, (x, y), radius, 255, -1)
-            if hasattr(self, "selection_mask") and isinstance(self.selection_mask, np.ndarray) and self.selection_mask.shape == self.object_mask.shape:
-                cv2.circle(self.selection_mask, (x, y), radius, 255, -1)
             self.refresh_object_canvas()
             self.show_brush_preview(event)
 
@@ -957,7 +1040,6 @@ class PhotoColorMatcherApp(tk.Tk):
         if 0 <= x < w and 0 <= y < h:
             radius = max(1, int(self.brush_size.get() / scale / 2))
             cv2.circle(self.object_mask, (x, y), radius, 0, -1)
-            # Keep the auxiliary edit mask consistent when it exists.
             if isinstance(self.object_edit_mask, np.ndarray) and self.object_edit_mask.shape == self.object_mask.shape:
                 cv2.circle(self.object_edit_mask, (x, y), radius, 0, -1)
             if hasattr(self, "selection_mask") and isinstance(self.selection_mask, np.ndarray) and self.selection_mask.shape == self.object_mask.shape:
