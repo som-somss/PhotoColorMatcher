@@ -392,6 +392,10 @@ class PhotoColorMatcherApp(tk.Tk):
         self.move_layer = None
         self.move_mask = None
         self.move_offset = (0, 0)
+        # V18 non-destructive object layers. The background image is never cut/blanked.
+        self.object_layers = []
+        self.active_layer_index = None
+        self.layer_background = None
         self._last_brush_point = None
         self.brush_size = tk.DoubleVar(value=35)
         self.inpaint_radius = tk.DoubleVar(value=5)
@@ -593,8 +597,24 @@ class PhotoColorMatcherApp(tk.Tk):
         self.object_select_status = ttk.Label(color_opts, text="브러시 모드 · Ctrl+마우스 휠: 확대/축소 · 직접 영역 선택으로 외곽선을 딸 수 있습니다.")
         self.object_select_status.pack(side="left", padx=12)
 
-        self.object_canvas = tk.Canvas(wrap, bg="#333333", highlightthickness=0, cursor="crosshair")
-        self.object_canvas.pack(fill="both", expand=True)
+        work_area = ttk.Frame(wrap)
+        work_area.pack(fill="both", expand=True)
+        self.object_canvas = tk.Canvas(work_area, bg="#333333", highlightthickness=0, cursor="crosshair")
+        self.object_canvas.pack(side="left", fill="both", expand=True)
+
+        # Layer panel: moved objects are independent overlays; background stays untouched.
+        layer_panel = ttk.LabelFrame(work_area, text="레이어", padding=6, width=190)
+        layer_panel.pack(side="right", fill="y", padx=(8, 0))
+        layer_panel.pack_propagate(False)
+        self.layer_listbox = tk.Listbox(layer_panel, width=24, exportselection=False)
+        self.layer_listbox.pack(fill="both", expand=True)
+        self.layer_listbox.bind("<<ListboxSelect>>", self._on_layer_select)
+        layer_btns = ttk.Frame(layer_panel)
+        layer_btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(layer_btns, text="표시/숨김", command=self.toggle_active_layer_visibility).pack(fill="x")
+        ttk.Button(layer_btns, text="레이어 삭제", command=self.delete_active_layer).pack(fill="x", pady=(4, 0))
+        ttk.Label(layer_panel, text="이동할 영역을 선택 후\n↔ 이동 아이콘을 누르면\n새 객체 레이어가 생성됩니다.", justify="left").pack(anchor="w", pady=(8,0))
+
         self.object_canvas.bind("<Button-1>", self.object_canvas_click)
         self.object_canvas.bind("<B1-Motion>", self.object_canvas_drag)
         self.object_canvas.bind("<ButtonRelease-1>", self.object_canvas_release)
@@ -621,6 +641,10 @@ class PhotoColorMatcherApp(tk.Tk):
             self.object_compare_original = False
             self.object_mask = np.zeros(bgr.shape[:2], dtype=np.uint8)
             self.object_history = []
+            self.object_layers = []
+            self.active_layer_index = None
+            self.layer_background = bgr.copy()
+            self._refresh_layer_list()
             self.clone_source_mode = False
             self.clone_source_point = None
             self.object_select_mode = False
@@ -710,100 +734,151 @@ class PhotoColorMatcherApp(tk.Tk):
         return "break"
 
 
-    def _make_blank_cut_base(self, image, mask):
-        """Return image with mask area blank instead of inpainted.
+    def _refresh_layer_list(self):
+        if not hasattr(self, "layer_listbox"):
+            return
+        self.layer_listbox.delete(0, tk.END)
+        self.layer_listbox.insert(tk.END, "🔒 배경")
+        for i, layer in enumerate(self.object_layers):
+            eye = "●" if layer.get("visible", True) else "○"
+            self.layer_listbox.insert(tk.END, f"{eye} {layer.get('name', f'객체 {i+1}')}" )
+        if self.active_layer_index is not None and 0 <= self.active_layer_index < len(self.object_layers):
+            self.layer_listbox.selection_set(self.active_layer_index + 1)
 
-        For the current BGR editing pipeline, blank means pure white. If a future
-        BGRA image reaches this path, the cut area is made transparent as well.
-        """
-        base = image.copy()
-        selected = mask > 0
-        if base.ndim == 2:
-            base[selected] = 255
-        elif base.shape[2] >= 4:
-            base[selected, :3] = 255
-            base[selected, 3] = 0
-        else:
-            base[selected, :3] = 255
-        return base
+    def _on_layer_select(self, event=None):
+        if not hasattr(self, "layer_listbox"):
+            return
+        sel = self.layer_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0] - 1
+        if idx < 0:
+            self.active_layer_index = None
+            return
+        if idx < len(self.object_layers):
+            self.active_layer_index = idx
+            layer = self.object_layers[idx]
+            self.move_mask = self._shift_mask(layer["mask"], layer.get("dx",0), layer.get("dy",0))
+            self.object_mask = self.move_mask.copy()
+            self.selection_mask = self.move_mask.copy()
+            self._set_remove_tool_bindings("move")
+            self.refresh_object_canvas()
+
+    def _shift_mask(self, mask, dx, dy):
+        h, w = mask.shape[:2]
+        out = np.zeros_like(mask)
+        ys, xs = np.where(mask > 0)
+        nx, ny = xs + int(dx), ys + int(dy)
+        valid = (nx >= 0) & (nx < w) & (ny >= 0) & (ny < h)
+        out[ny[valid], nx[valid]] = 255
+        return out
+
+    def _compose_layers(self):
+        if self.layer_background is None:
+            if self.object_result is None: return None
+            self.layer_background = self.object_result.copy()
+        out = self.layer_background.copy()
+        h, w = out.shape[:2]
+        for layer in self.object_layers:
+            if not layer.get("visible", True):
+                continue
+            mask = layer["mask"]
+            pixels = layer["pixels"]
+            dx, dy = int(layer.get("dx",0)), int(layer.get("dy",0))
+            ys, xs = np.where(mask > 0)
+            nx, ny = xs + dx, ys + dy
+            valid = (nx >= 0) & (nx < w) & (ny >= 0) & (ny < h)
+            out[ny[valid], nx[valid], :3] = pixels[ys[valid], xs[valid], :3]
+        return out
+
+    def toggle_active_layer_visibility(self):
+        if self.active_layer_index is None or not (0 <= self.active_layer_index < len(self.object_layers)):
+            messagebox.showinfo(APP_TITLE, "레이어 목록에서 객체 레이어를 선택해주세요.")
+            return
+        layer = self.object_layers[self.active_layer_index]
+        layer["visible"] = not layer.get("visible", True)
+        self.object_result = self._compose_layers()
+        self._refresh_layer_list(); self.refresh_object_canvas()
+
+    def delete_active_layer(self):
+        if self.active_layer_index is None or not (0 <= self.active_layer_index < len(self.object_layers)):
+            messagebox.showinfo(APP_TITLE, "삭제할 객체 레이어를 선택해주세요.")
+            return
+        self.object_layers.pop(self.active_layer_index)
+        self.active_layer_index = None
+        self.object_result = self._compose_layers()
+        if self.object_mask is not None: self.object_mask[:] = 0
+        self._refresh_layer_list(); self.refresh_object_canvas()
 
     def activate_move_mode(self):
-        """Cut the current selection into a movable layer and drag it to a new position."""
+        """Create/select a movable object layer without altering the background."""
         if self.object_result is None:
             messagebox.showwarning(APP_TITLE, "먼저 사진을 열어주세요.")
             return "break"
         mask = self.object_mask
         if mask is None or not np.any(mask):
-            messagebox.showwarning(APP_TITLE, "먼저 사각형/타원형/직접 선택 또는 브러시로 이동할 영역을 선택해주세요.")
+            # If a layer is selected in the panel, simply reactivate moving it.
+            if self.active_layer_index is not None and 0 <= self.active_layer_index < len(self.object_layers):
+                layer = self.object_layers[self.active_layer_index]
+                self.move_mask = self._shift_mask(layer["mask"], layer.get("dx",0), layer.get("dy",0))
+                self._set_remove_tool_bindings("move")
+                return "break"
+            messagebox.showwarning(APP_TITLE, "먼저 이동할 영역을 선택해주세요.")
             return "break"
         self.clone_source_mode = False
-        self._set_remove_tool_bindings("move")
+        # Freeze the current edited picture as the untouched background when the first object layer is made.
+        if self.layer_background is None or len(self.object_layers) == 0:
+            self.layer_background = self.object_result.copy()
+        source = self.object_result.copy()
+        layer = {
+            "name": f"객체 {len(self.object_layers)+1}",
+            "pixels": source,
+            "mask": (mask > 0).astype(np.uint8) * 255,
+            "dx": 0, "dy": 0, "visible": True
+        }
+        self.object_layers.append(layer)
+        self.active_layer_index = len(self.object_layers)-1
+        self.move_mask = layer["mask"].copy()
         self.move_drag_start = None
-        self.move_offset = (0, 0)
-        self.move_mask = (mask > 0).astype(np.uint8) * 255
-        # Keep one movable object layer. The selected pixels are NOT copied repeatedly.
-        # move_layer stores the pixels at their current position, while move_base_result
-        # is the background with the selected area cut out.
-        self.move_layer = self.object_result.copy()
-        self.move_base_result = self._make_blank_cut_base(self.object_result, self.move_mask)
+        self.move_offset = (0,0)
+        self._set_remove_tool_bindings("move")
+        self._refresh_layer_list()
+        self.object_result = self._compose_layers()
         self.refresh_object_canvas()
-        self.object_select_status.config(text="이동 도구 · 선택 물체를 드래그해 이동합니다. 잘라낸 원래 자리는 빈 화면으로 남습니다.")
+        self.object_select_status.config(text="객체 레이어 생성 완료 · 배경은 그대로 유지됩니다. 선택 객체를 드래그해 이동하세요.")
         return "break"
 
     def move_selection_start(self, event):
-        if self.move_mask is None or not np.any(self.move_mask):
+        if self.active_layer_index is None or not (0 <= self.active_layer_index < len(self.object_layers)):
             return
+        layer = self.object_layers[self.active_layer_index]
+        current_mask = self._shift_mask(layer["mask"], layer.get("dx",0), layer.get("dy",0))
         x, y = self._canvas_to_image(event.x, event.y)
-        h, w = self.move_mask.shape[:2]
-        if 0 <= x < w and 0 <= y < h and self.move_mask[y, x] > 0:
-            self.move_drag_start = (x, y)
-            self.move_offset = (0, 0)
-
-    def _compose_moved_selection(self, dx, dy):
-        base = self.move_base_result.copy()
-        h, w = self.move_mask.shape[:2]
-        ys, xs = np.where(self.move_mask > 0)
-        if len(xs) == 0: return base
-        nx, ny = xs + dx, ys + dy
-        valid = (nx >= 0) & (nx < w) & (ny >= 0) & (ny < h)
-        base[ny[valid], nx[valid], :3] = self.move_layer[ys[valid], xs[valid], :3]
-        if base.ndim == 3 and base.shape[2] > 3 and self.move_layer.shape[2] > 3:
-            base[ny[valid], nx[valid], 3:] = self.move_layer[ys[valid], xs[valid], 3:]
-        return base
+        h, w = current_mask.shape[:2]
+        if 0 <= x < w and 0 <= y < h and current_mask[y,x] > 0:
+            self.move_drag_start = (x,y)
+            self.move_offset = (layer.get("dx",0), layer.get("dy",0))
 
     def move_selection_drag(self, event):
-        if self.move_drag_start is None: return
+        if self.move_drag_start is None or self.active_layer_index is None: return
         x, y = self._canvas_to_image(event.x, event.y)
-        dx, dy = x - self.move_drag_start[0], y - self.move_drag_start[1]
-        self.move_offset = (dx, dy)
-        self.object_result = self._compose_moved_selection(dx, dy)
+        layer = self.object_layers[self.active_layer_index]
+        start_dx, start_dy = self.move_offset
+        layer["dx"] = start_dx + (x-self.move_drag_start[0])
+        layer["dy"] = start_dy + (y-self.move_drag_start[1])
+        self.move_mask = self._shift_mask(layer["mask"], layer["dx"], layer["dy"])
+        self.object_mask = self.move_mask.copy()
+        self.selection_mask = self.move_mask.copy()
+        self.object_result = self._compose_layers()
         self.refresh_object_canvas()
 
     def move_selection_end(self, event):
         if self.move_drag_start is None: return
-        dx, dy = self.move_offset
-        # Store the exact composite before this move for Undo.
-        previous_composite = self._compose_moved_selection(0, 0)
-        self.object_history.append(previous_composite.copy())
-        self.object_result = self._compose_moved_selection(dx, dy)
-        # Move the selection mask with the pixels so further edits target the new location.
-        h, w = self.move_mask.shape[:2]
-        shifted = np.zeros_like(self.move_mask)
-        ys, xs = np.where(self.move_mask > 0); nx, ny = xs + dx, ys + dy
-        valid = (nx >= 0) & (nx < w) & (ny >= 0) & (ny < h)
-        shifted[ny[valid], nx[valid]] = 255
-        self.object_mask = shifted
-        self.selection_mask = shifted.copy()
-        self.move_mask = shifted.copy()
-        # Rebase the same single movable layer at its new location. Blank the
-        # current object position in the background so the next drag MOVES it
-        # instead of leaving another copy behind.
-        self.move_layer = self.object_result.copy()
-        self.move_base_result = self._make_blank_cut_base(self.object_result, self.move_mask)
         self.move_drag_start = None
-        self.move_offset = (0, 0)
-        self.refresh_object_canvas()
-        self.object_select_status.config(text="이동 완료 · 다시 선택한 영역을 드래그하거나 실행 취소할 수 있습니다.")
+        self.move_offset = (0,0)
+        self.object_result = self._compose_layers()
+        self._refresh_layer_list(); self.refresh_object_canvas()
+        self.object_select_status.config(text="이동 완료 · 배경은 변경되지 않았고 객체는 별도 레이어로 유지됩니다.")
 
     def activate_crop_mode(self):
         """Select a rectangular area to cut and immediately prepare it for moving."""
@@ -865,7 +940,7 @@ class PhotoColorMatcherApp(tk.Tk):
         self.refresh_object_canvas()
         self.activate_move_mode()
         if hasattr(self, "object_select_status"):
-            self.object_select_status.config(text="영역 선택 완료 · 선택 물체를 드래그해 이동합니다. 원래 자리는 빈 화면으로 남습니다.")
+            self.object_select_status.config(text="영역 선택 완료 · 선택 물체를 드래그해 이동합니다. 배경은 그대로 유지되고 객체 레이어만 이동합니다.")
         try: self.status_var.set("영역 선택 완료: 선택 영역을 드래그해서 이동하세요.")
         except Exception: pass
 
@@ -1531,6 +1606,15 @@ class PhotoColorMatcherApp(tk.Tk):
         self.refresh_object_canvas()
 
     def undo_object_removal(self):
+        if getattr(self, "object_layers", None):
+            idx = self.active_layer_index if self.active_layer_index is not None else len(self.object_layers)-1
+            if 0 <= idx < len(self.object_layers):
+                self.object_layers.pop(idx)
+                self.active_layer_index = None
+                self.object_result = self._compose_layers()
+                if self.object_mask is not None: self.object_mask[:] = 0
+                self._refresh_layer_list(); self.refresh_object_canvas()
+                return
         if self.object_history:
             item = self.object_history.pop()
             if isinstance(item, tuple) and len(item) == 3 and item[0] == "crop":
@@ -1552,6 +1636,10 @@ class PhotoColorMatcherApp(tk.Tk):
             self.object_bgr = base.copy()
             self.object_result = base.copy()
             self.object_history = []
+            self.object_layers = []
+            self.active_layer_index = None
+            self.layer_background = base.copy()
+            self._refresh_layer_list()
             if self.object_mask is not None:
                 self.object_mask[:] = 0
             self.object_edit_mask = None
