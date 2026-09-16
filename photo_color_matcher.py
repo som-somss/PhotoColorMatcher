@@ -13,7 +13,7 @@ APP_TITLE = "Photo Color Matcher Pro"
 SUPPORTED = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
-def make_toolbar_icon(kind, size=34, fg="#f7f9fb"):
+def make_toolbar_icon(kind, size=28, fg="#f7f9fb"):
     """Render crisp Photoshop-style monochrome icons using 4x supersampling.
 
     The icon is drawn at high resolution and reduced with LANCZOS, so the EXE
@@ -122,6 +122,20 @@ def make_toolbar_icon(kind, size=34, fg="#f7f9fb"):
         poly([(22.8,5.0),(17.7,10.0),(25.8,11.2)])
         # subtle second contour suggesting pixels being pushed
         d.arc(box(5.0,5.5,18.0,18.5), start=205, end=325, fill=c, width=max(3,lw-2))
+    elif kind == "freeze":
+        # Freeze/protect mask: shield + small brush dot.
+        poly([(15,3.5),(24,7),(22.5,17),(15,26),(7.5,17),(6,7)])
+        d.ellipse(box(12,10,18,16), fill="#343b42")
+    elif kind == "freeze_erase":
+        # Unfreeze: shield with diagonal slash.
+        poly([(15,3.5),(24,7),(22.5,17),(15,26),(7.5,17),(6,7)])
+        line([(6,24),(24,6)], width=max(4,w), fill="#343b42")
+    elif kind == "bloat":
+        # Bloat/pucker-family icon: arrows expanding from a center point.
+        d.ellipse(box(12.5,12.5,17.5,17.5), fill=c)
+        for a,b in [((15,11),(15,4)),((15,19),(15,26)),((11,15),(4,15)),((19,15),(26,15))]: line([a,b],width=max(3,w-2))
+        poly([(15,3),(11.5,7),(18.5,7)]); poly([(15,27),(11.5,23),(18.5,23)])
+        poly([(3,15),(7,11.5),(7,18.5)]); poly([(27,15),(23,11.5),(23,18.5)])
     elif kind == "blur":
         # Photoshop-style blur tool: clean water droplet silhouette
         # pointed top with a rounded lower body
@@ -442,6 +456,9 @@ class PhotoColorMatcherApp(tk.Tk):
         self.liquify_strength = tk.DoubleVar(value=45)
         self._liquify_base = None
         self._liquify_last_point = None
+        self.freeze_mask = None
+        self._freeze_last_point = None
+        self._bloat_base = None
         self.brush_preview_id = None
         self.clone_source_mode = False
         self.clone_source_point = None
@@ -494,6 +511,11 @@ class PhotoColorMatcherApp(tk.Tk):
         self.bind_all("<Key-U>", lambda e: self.activate_blur_brush_mode())
         self.bind_all("<Key-w>", lambda e: self.activate_liquify_mode())
         self.bind_all("<Key-W>", lambda e: self.activate_liquify_mode())
+        self.bind_all("<Key-f>", lambda e: self.activate_freeze_mode())
+        self.bind_all("<Key-F>", lambda e: self.activate_freeze_mode())
+        self.bind_all("<Shift-F>", lambda e: self.activate_unfreeze_mode())
+        self.bind_all("<Key-p>", lambda e: self.activate_bloat_mode())
+        self.bind_all("<Key-P>", lambda e: self.activate_bloat_mode())
         self.bind_all("<Key-c>", lambda e: self.toggle_object_compare())
         self.bind_all("<Key-C>", lambda e: self.toggle_object_compare())
         self.bind_all("<Delete>", lambda e: self.delete_selection_to_white())
@@ -604,9 +626,9 @@ class PhotoColorMatcherApp(tk.Tk):
         self._tool_buttons = {}
 
         def add_icon(kind, tip, command, tool_key=None, gap=2):
-            img = ImageTk.PhotoImage(make_toolbar_icon(kind, 34))
+            img = ImageTk.PhotoImage(make_toolbar_icon(kind, 28))
             self._toolbar_images[tip] = img
-            b = tk.Button(bar, image=img, command=command, width=46, height=46,
+            b = tk.Button(bar, image=img, command=command, width=38, height=38,
                           bg="#343b42", activebackground="#2387f3", relief="flat", bd=0,
                           highlightthickness=1, highlightbackground="#4a535c", cursor="hand2")
             b.pack(side="left", padx=gap)
@@ -628,6 +650,9 @@ class PhotoColorMatcherApp(tk.Tk):
         add_icon("color", "선택 색상 변경", self.apply_object_color)
         add_icon("blur", "브러시 블러 · U", self.activate_blur_brush_mode, "blur_brush")
         add_icon("liquify", "성형 · 드래그하여 밀기 · W", self.activate_liquify_mode, "liquify")
+        add_icon("freeze", "성형 보호 마스크 · F", self.activate_freeze_mode, "freeze")
+        add_icon("freeze_erase", "성형 보호 마스크 지우기 · Shift+F", self.activate_unfreeze_mode, "unfreeze")
+        add_icon("bloat", "볼록하게 · P", self.activate_bloat_mode, "bloat")
         add_icon("cut_delete", "선택 영역 완전 삭제 · Delete", self.delete_selection_to_white)
         add_icon("remove", "선택 영역 삭제 · 주변 배경 복원", self.run_object_removal)
         add_icon("eyedrop", "질감 원본 선택 · Ctrl+Shift+D", self.activate_clone_source_mode, "clone_source")
@@ -818,7 +843,7 @@ class PhotoColorMatcherApp(tk.Tk):
             self.object_select_points = []
         self.hide_brush_preview()
         if hasattr(self, "object_canvas"):
-            cursor = "fleur" if tool == "move" else ("pencil" if tool in ("brush", "eraser", "blur_brush", "liquify") else ("tcross" if tool in ("crop", "canvas_crop") else "crosshair"))
+            cursor = "fleur" if tool == "move" else ("pencil" if tool in ("brush", "eraser", "blur_brush", "liquify", "freeze", "unfreeze", "bloat") else ("tcross" if tool in ("crop", "canvas_crop") else "crosshair"))
             self.object_canvas.configure(cursor=cursor)
         return "break"
 
@@ -1540,6 +1565,84 @@ class PhotoColorMatcherApp(tk.Tk):
     def object_canvas_release(self, event):
         return
 
+    def _ensure_freeze_mask(self):
+        if self.object_result is None: return None
+        h,w=self.object_result.shape[:2]
+        if not isinstance(self.freeze_mask,np.ndarray) or self.freeze_mask.shape!=(h,w):
+            self.freeze_mask=np.zeros((h,w),dtype=np.uint8)
+        return self.freeze_mask
+
+    def activate_freeze_mode(self):
+        if self.object_result is None: return "break"
+        self._ensure_freeze_mask(); self._freeze_last_point=None
+        self._set_remove_tool_bindings("freeze")
+        self.object_select_status.config(text="성형 보호 마스크 · F · 고정할 부분을 칠하세요. 파란색 영역은 성형되지 않습니다.")
+        return "break"
+
+    def activate_unfreeze_mode(self):
+        if self.object_result is None: return "break"
+        self._ensure_freeze_mask(); self._freeze_last_point=None
+        self._set_remove_tool_bindings("unfreeze")
+        self.object_select_status.config(text="보호 마스크 지우기 · Shift+F · 보호를 해제할 부분을 칠하세요.")
+        return "break"
+
+    def _paint_freeze(self,event,erase=False):
+        m=self._ensure_freeze_mask()
+        if m is None:return
+        x,y=self._canvas_to_image(event.x,event.y); h,w=m.shape
+        if not(0<=x<w and 0<=y<h):return
+        r=max(1,int(self.brush_size.get()/max(self.object_display_scale,1e-6)/2)); val=0 if erase else 255
+        if self._freeze_last_point is not None: cv2.line(m,self._freeze_last_point,(x,y),val,r*2,cv2.LINE_AA)
+        cv2.circle(m,(x,y),r,val,-1,cv2.LINE_AA); self._freeze_last_point=(x,y)
+        self.refresh_object_canvas(); self.show_brush_preview(event)
+
+    def _active_layer_edit_target(self):
+        """Return editable image/mask. Object-layer edits never touch background."""
+        if self.active_layer_index is None or not (0<=self.active_layer_index<len(self.object_layers)):
+            return self.object_result, None, None
+        layer=self.object_layers[self.active_layer_index]
+        # bake current scale/translation into a full-canvas independent layer
+        h,w=self.object_result.shape[:2]; pix=np.zeros((h,w,3),dtype=np.uint8); mask=self._layer_current_mask(layer)
+        sp,sm,bx,by=self._scaled_layer_data(layer); bx+=int(layer.get('dx',0)); by+=int(layer.get('dy',0))
+        y0=max(0,by);x0=max(0,bx);y1=min(h,by+sm.shape[0]);x1=min(w,bx+sm.shape[1])
+        if x1>x0 and y1>y0:
+            sy=y0-by;sx=x0-bx; pp=sp[sy:sy+y1-y0,sx:sx+x1-x0]; mm=sm[sy:sy+y1-y0,sx:sx+x1-x0]>0
+            roi=pix[y0:y1,x0:x1]; roi[mm]=pp[mm]
+        return pix,mask,layer
+
+    def _commit_active_layer_edit(self,pix,mask,layer):
+        if layer is None:
+            self.object_result=pix
+        else:
+            layer['pixels']=pix; layer['mask']=mask; layer['dx']=0; layer['dy']=0; layer['scale']=1.0
+            self.object_result=self._compose_layers(); self._refresh_layer_list()
+
+    def activate_bloat_mode(self):
+        if self.object_result is None:return "break"
+        self._set_remove_tool_bindings("bloat")
+        self.object_select_status.config(text="볼록하게 · P · 클릭하거나 드래그하면 브러시 중심에서 바깥쪽으로 부풀어 오릅니다.")
+        return "break"
+
+    def _apply_bloat(self,event):
+        img,valid,layer=self._active_layer_edit_target()
+        if img is None:return
+        x,y=self._canvas_to_image(event.x,event.y); h,w=img.shape[:2]
+        if not(0<=x<w and 0<=y<h):return
+        r=max(3,int(self.brush_size.get()/max(self.object_display_scale,1e-6)/2)); st=max(.01,min(1.,float(self.liquify_strength.get())/100.))
+        yy,xx=np.ogrid[:h,:w]; rx=xx-x; ry=yy-y; d=np.sqrt(rx*rx+ry*ry); inside=d<r
+        fall=np.zeros((h,w),np.float32); fall[inside]=(1-d[inside]/r)**2
+        # inverse mapping toward center makes destination appear expanded
+        factor=st*.45*fall
+        mx=np.tile(np.arange(w,dtype=np.float32),(h,1))-rx*factor
+        my=np.tile(np.arange(h,dtype=np.float32)[:,None],(1,w))-ry*factor
+        warped=cv2.remap(img,mx,my,cv2.INTER_CUBIC,borderMode=cv2.BORDER_REFLECT)
+        if valid is not None:
+            wm=cv2.remap(valid,mx,my,cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT)
+            warped[wm==0]=0; valid=wm
+        fm=self._ensure_freeze_mask()
+        if fm is not None and np.any(fm): warped[fm>0]=img[fm>0]
+        self._commit_active_layer_edit(warped,valid,layer); self.refresh_object_canvas(); self.show_brush_preview(event)
+
     def activate_liquify_mode(self):
         """Photoshop-like liquify push tool. Drag inside the brush to push pixels."""
         if self.object_result is None:
@@ -1556,46 +1659,37 @@ class PhotoColorMatcherApp(tk.Tk):
         return "break"
 
     def _start_liquify_stroke(self, event):
-        if self.object_result is None: return
-        self._liquify_base = self.object_result.copy()
-        self._liquify_last_point = self._canvas_to_image(event.x, event.y)
-        self.show_brush_preview(event)
+        img,mask,layer=self._active_layer_edit_target()
+        if img is None:return
+        self._liquify_base=(img.copy(), None if mask is None else mask.copy(), layer)
+        self._liquify_last_point=self._canvas_to_image(event.x,event.y); self.show_brush_preview(event)
 
     def _paint_liquify_stroke(self, event):
-        if self.object_result is None: return
-        if self._liquify_last_point is None:
-            self._start_liquify_stroke(event); return
-        x, y = self._canvas_to_image(event.x, event.y)
-        px, py = self._liquify_last_point
-        h, w = self.object_result.shape[:2]
-        if not (0 <= x < w and 0 <= y < h): return
-        dx, dy = x-px, y-py
-        dist = (dx*dx + dy*dy) ** 0.5
-        if dist < 0.5: return
-        scale=max(float(self.object_display_scale),1e-6)
-        radius=max(3,int(self.brush_size.get()/scale/2))
-        strength=max(0.01,min(1.0,float(self.liquify_strength.get())/100.0))
-        # Limit a single event's displacement so fast mouse motion remains smooth.
-        max_step=max(1.0,radius*0.35)
-        if dist > max_step:
-            f=max_step/dist; dx*=f; dy*=f
-        yy, xx = np.ogrid[:h, :w]
-        d2=(xx-x)**2+(yy-y)**2
-        inside=d2 <= radius*radius
-        fall=np.zeros((h,w),np.float32)
-        fall[inside]=(1.0-np.sqrt(d2[inside])/radius)**2
-        # Inverse remap: destination pixels sample from the opposite direction.
-        map_x=np.tile(np.arange(w,dtype=np.float32),(h,1)) - fall*(dx*strength)
-        map_y=np.tile(np.arange(h,dtype=np.float32)[:,None],(1,w)) - fall*(dy*strength)
-        self.object_result=cv2.remap(self.object_result,map_x,map_y,cv2.INTER_CUBIC,borderMode=cv2.BORDER_REFLECT)
-        self._liquify_last_point=(x,y)
-        self.object_compare_original=False
+        img,valid,layer=self._active_layer_edit_target()
+        if img is None:return
+        if self._liquify_last_point is None:self._start_liquify_stroke(event);return
+        x,y=self._canvas_to_image(event.x,event.y); px,py=self._liquify_last_point; h,w=img.shape[:2]
+        if not(0<=x<w and 0<=y<h):return
+        dx,dy=x-px,y-py; dist=(dx*dx+dy*dy)**.5
+        if dist<.5:return
+        r=max(3,int(self.brush_size.get()/max(self.object_display_scale,1e-6)/2)); st=max(.01,min(1.,float(self.liquify_strength.get())/100.))
+        ms=max(1.,r*.35)
+        if dist>ms:f=ms/dist;dx*=f;dy*=f
+        yy,xx=np.ogrid[:h,:w]; d2=(xx-x)**2+(yy-y)**2; inside=d2<=r*r; fall=np.zeros((h,w),np.float32); fall[inside]=(1-np.sqrt(d2[inside])/r)**2
+        fm=self._ensure_freeze_mask()
+        if fm is not None and np.any(fm):
+            # soften protection edge to prevent tearing
+            protect=cv2.GaussianBlur((fm>0).astype(np.float32),(0,0),max(1.,r*.12)); fall*=1-np.clip(protect,0,1)
+        mx=np.tile(np.arange(w,dtype=np.float32),(h,1))-fall*(dx*st); my=np.tile(np.arange(h,dtype=np.float32)[:,None],(1,w))-fall*(dy*st)
+        warped=cv2.remap(img,mx,my,cv2.INTER_CUBIC,borderMode=cv2.BORDER_REFLECT)
+        if valid is not None:
+            valid=cv2.remap(valid,mx,my,cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT); warped[valid==0]=0
+        self._commit_active_layer_edit(warped,valid,layer); self._liquify_last_point=(x,y); self.object_compare_original=False
         self.refresh_object_canvas(); self.show_brush_preview(event)
 
     def _finish_liquify_stroke(self):
-        if isinstance(self._liquify_base,np.ndarray) and self.object_result is not None:
-            if not np.array_equal(self._liquify_base,self.object_result):
-                self.object_history.append(self._liquify_base.copy())
+        if self._liquify_base is not None and self.object_result is not None:
+            pass
         self._liquify_base=None
         self._liquify_last_point=None
         if hasattr(self,"object_select_status"):
@@ -1835,6 +1929,12 @@ class PhotoColorMatcherApp(tk.Tk):
             self._paint_blur_stroke(event)
         elif tool == "liquify":
             self._start_liquify_stroke(event)
+        elif tool == "freeze":
+            self._freeze_last_point=None; self._paint_freeze(event,False)
+        elif tool == "unfreeze":
+            self._freeze_last_point=None; self._paint_freeze(event,True)
+        elif tool == "bloat":
+            self._apply_bloat(event)
         return "break"
 
     def object_canvas_drag(self, event):
@@ -1855,6 +1955,12 @@ class PhotoColorMatcherApp(tk.Tk):
             self._paint_blur_stroke(event)
         elif tool == "liquify":
             self._paint_liquify_stroke(event)
+        elif tool == "freeze":
+            self._paint_freeze(event,False)
+        elif tool == "unfreeze":
+            self._paint_freeze(event,True)
+        elif tool == "bloat":
+            self._apply_bloat(event)
         return "break"
 
     def object_canvas_release(self, event):
@@ -1870,6 +1976,8 @@ class PhotoColorMatcherApp(tk.Tk):
             self._finish_blur_stroke()
         elif self.active_remove_tool == "liquify":
             self._finish_liquify_stroke()
+        elif self.active_remove_tool in ("freeze","unfreeze"):
+            self._freeze_last_point=None
         self._last_brush_point = None
         return "break"
 
@@ -1877,7 +1985,7 @@ class PhotoColorMatcherApp(tk.Tk):
         """현재 브러시 크기를 마우스 위치에 빨간 원으로 표시."""
         if self.object_result is None:
             return
-        if self.active_remove_tool not in ("brush", "eraser", "blur_brush", "liquify"):
+        if self.active_remove_tool not in ("brush", "eraser", "blur_brush", "liquify", "freeze", "unfreeze", "bloat"):
             self.hide_brush_preview()
             return
         if self.brush_preview_id is not None:
